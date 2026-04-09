@@ -13,6 +13,7 @@ from collections import defaultdict
 from typing import Dict, List
 
 import numpy as np
+from transformers import AutoTokenizer
 import torch, torch.nn as nn, torch.nn.functional as F
 from accelerate import Accelerator
 from accelerate.utils import set_seed
@@ -324,7 +325,7 @@ def main():
         report_to = "neptune"
 
     # Processor
-    processor = AutoProcessor.from_pretrained(args.model_id, trust_remote_code=True, token=hf_token)
+    processor = AutoTokenizer.from_pretrained(args.model_id, trust_remote_code=True, token=hf_token)
     if hasattr(processor, "tokenizer") and processor.tokenizer.pad_token_id is None:
         processor.tokenizer.pad_token = processor.tokenizer.eos_token
 
