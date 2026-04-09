@@ -249,7 +249,7 @@ class ContrastiveModel(nn.Module):
         
         # Sauvegarder aussi la projection head
         torch.save(self.projection_head.state_dict(), os.path.join(output_dir, "projection_head.pt"))
-        config = {"base_model_id": self.base_model_id,"projection_dim": self.projection_head[3].normalized_shape[0], "temperature": self.infonce_loss.temperature}
+        config = {"base_model_id": self.base_model_id,"projection_dim": self.projection_head[3], "temperature": self.infonce_loss.temperature}
         json.dump(config, open(os.path.join(output_dir, "contrastive_config.json"), "w"))
         
         logger.info(f"✅ LoRA adapter (with adapter_config.json) and projection head saved to {output_dir}")
