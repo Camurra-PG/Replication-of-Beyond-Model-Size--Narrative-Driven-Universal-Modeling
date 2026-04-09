@@ -408,7 +408,6 @@ def main():
         gradient_checkpointing        = True,
         gradient_checkpointing_kwargs = {"use_reentrant": False},
         ddp_find_unused_parameters    = False,
-        save_safetensors=False,
     )
 
     trainer = ContrastiveTrainer(
