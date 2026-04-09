@@ -13,7 +13,7 @@ from collections import defaultdict
 from typing import Dict, List
 
 import numpy as np
-from transformers import AutoTokenizer
+from transformers import AutoModelForCausalLM, AutoTokenizer
 import torch, torch.nn as nn, torch.nn.functional as F
 from accelerate import Accelerator
 from accelerate.utils import set_seed
@@ -348,7 +348,7 @@ def main():
         load["max_memory"] = {"cuda:0": "35GiB", "cuda:1": "35GiB", "cuda:2": "35GiB", "cuda:3": "35GiB",
                               "cuda:4": "35GiB","cuda:5": "35GiB","cuda:6": "35GiB","cuda:7": "35GiB"}
 
-    backbone = Gemma3ForConditionalGeneration.from_pretrained(args.model_id, **load)
+    backbone = AutoModelForCausalLM.from_pretrained(args.model_id, **load)
     backbone.config.use_cache = False
     if args.load_in_4bit:
         backbone = prepare_model_for_kbit_training(
