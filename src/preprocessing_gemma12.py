@@ -320,7 +320,7 @@ else:
 
 # --- Generation Configuration ---
 BATCH_SIZE = 1000
-N_WORKERS = min(8, mp.cpu_count() // 2)
+N_WORKERS = 1
 
 print("Configuration:")
 print(f"- Batch size: {BATCH_SIZE}")
