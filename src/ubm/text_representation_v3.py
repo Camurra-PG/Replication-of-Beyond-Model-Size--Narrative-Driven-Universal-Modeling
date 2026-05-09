@@ -2409,16 +2409,18 @@ class AdvancedUBMGenerator:
         df = df.sort(['client_id','timestamp'])
         
         # Calcul vectorisé des sessions
-        time_diff = df.select([
-            pl.col('client_id'),
-            pl.col('timestamp').diff().over('client_id').dt.total_seconds() / 60
-        ])
+        df = df.with_columns(
+            (
+                pl.col('timestamp').diff().over('client_id').dt.total_seconds() / 60
+            ).alias('time_diff_min')
+        )
         
         df = df.with_columns(
-            ((time_diff['timestamp'] > 30) | time_diff['timestamp'].is_null())
-            .cum_sum()
-            .over('client_id')
-            .alias('session_id')
+              (
+                ((pl.col('time_diff_min') > 30) | pl.col('time_diff_min').is_null())
+                .cum_sum()
+                .over('client_id')
+            ).alias('session_id')
         )
         
         # 5. Compter les paires par chunks pour éviter OOM
