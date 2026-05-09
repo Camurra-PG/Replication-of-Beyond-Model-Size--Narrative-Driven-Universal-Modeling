@@ -7,11 +7,14 @@ import os; os.environ["SKIP_URL_GRAPH"] = "1"
 # 1) On détecte automatiquement  le nombre de vCPU (sur a2-highgpu-1g → 12)
 n_threads = 1
 print(f"n_threads:{n_threads}")
-os.environ["OPENBLAS_NUM_THREADS"] = "1"
-os.environ["MKL_NUM_THREADS"] = "1"
-os.environ["NUMEXPR_MAX_THREADS"] = "1"
-os.environ["OMP_NUM_THREADS"] = "1"
-os.environ["POLARS_MAX_THREADS"] = "1"
+
+os.environ["OPENBLAS_NUM_THREADS"]  = "1"
+os.environ["MKL_NUM_THREADS"]       = str(n_threads)
+os.environ["NUMEXPR_MAX_THREADS"]   = str(n_threads)
+os.environ["OMP_NUM_THREADS"]       = str(n_threads)
+
+# Polars (already set in your file – keep it!)
+os.environ["POLARS_MAX_THREADS"]    = str(n_threads)
 import unsloth
 # NetworKit – needs an explicit call
 import networkit as nk
@@ -2411,7 +2414,7 @@ class AdvancedUBMGenerator:
                 pl.col('timestamp').diff().over('client_id').dt.total_seconds() / 60
             ).alias('time_diff_min')
         )
-        
+
         df = df.with_columns(
             (
                 ((pl.col('time_diff_min') > 30) | pl.col('time_diff_min').is_null())
