@@ -109,12 +109,7 @@ class PortraitGenerator:
             device_map={"": device},
         )
         self.model.eval()
-        if os.getenv("ENABLE_TORCH_COMPILE", "0") == "1":
-            self.model = torch.compile(
-        self.model,
-        mode="reduce-overhead",
-        fullgraph=False,
-    )
+        self.model = torch.compile(self.model, mode="reduce-overhead", fullgraph=True)
         self.tpl = get_chat_template(tokenizer, "gemma-3")
         #self.base_tok = self.tpl.tokenizer
         self.base_tok = getattr(self.tpl, "tokenizer", self.tpl)
