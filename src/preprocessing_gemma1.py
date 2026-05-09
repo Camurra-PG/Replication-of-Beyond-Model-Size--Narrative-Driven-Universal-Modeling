@@ -1,3 +1,4 @@
+from preprocessing_gemma12 import TEST_MODE, TEST_SIZE
 import unsloth
 import os
 import sys
@@ -744,11 +745,11 @@ def main():
     # ====== PARAMÈTRES PAR DÉFAUT ======
     OUTPUT_DIR       = Path("output_features/gemma1b")
     TEXTS_FILE       = OUTPUT_DIR / f"texts_for_portraits_{TEST_SIZE}.pkl"
-    BATCH_SIZE       = 180          # nb de textes envoyés simultanément au modèle
-    CHECKPOINT_EVERY = 100         # batches avant snapshot
-    DRY_RUN_SIZE     = 6       # nombre de clients en mode --dry-run
+    BATCH_SIZE       = 1 if TEST_MODE else 180
+    CHECKPOINT_EVERY = 100
+    DRY_RUN_SIZE     = TEST_SIZE if TEST_MODE else None
     # ===================================
-    
+
     
     def setup_logging(run_id: str) -> None:
         log_dir = OUTPUT_DIR / "logs"
@@ -898,7 +899,7 @@ print(f"[GPU {gpu_id}] FIN — {len(results)} portraits")
                      g["id"], g["name"], g["free"], g["total"])
 
     # 2) Données
-    limit = DRY_RUN_SIZE
+    limit = DRY_RUN_SIZE if TEST_MODE else None
     texts = load_texts(limit)
     lens  = [len(t) for t in texts.values()]
     logging.info("Longueur moyenne : %.0f (min %d / max %d)",
