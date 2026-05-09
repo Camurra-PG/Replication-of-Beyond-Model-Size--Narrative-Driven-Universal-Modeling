@@ -13,7 +13,7 @@ echo "Destination directory: ${DEST_DIR}"
 
 # --- Step 1: Check if data already exists ---
 # We check for a key file to be sure.
-if [ -f "${DEST_DIR}/product_buy.parquet" ]; then
+if [ -f "${DEST_DIR}/input/product_buy.parquet" ] && [ -f "${DEST_DIR}/input/relevant_clients.npy" ] && [ -f "${DEST_DIR}/target/propensity_sku.npy" ]; then
     echo "✅ Data already exists in '${DEST_DIR}'. Nothing to do."
     exit 0
 fi
