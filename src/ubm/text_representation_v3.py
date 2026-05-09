@@ -5,10 +5,10 @@ import unsloth
 import os, multiprocessing
 import os; os.environ["SKIP_URL_GRAPH"] = "1"
 # 1) On détecte automatiquement  le nombre de vCPU (sur a2-highgpu-1g → 12)
-n_threads = 1
+n_threads = multiprocessing.cpu_count()
 print(f"n_threads:{n_threads}")
 
-os.environ["OPENBLAS_NUM_THREADS"]  = "1"
+os.environ["OPENBLAS_NUM_THREADS"]  = "12"
 os.environ["MKL_NUM_THREADS"]       = str(n_threads)
 os.environ["NUMEXPR_MAX_THREADS"]   = str(n_threads)
 os.environ["OMP_NUM_THREADS"]       = str(n_threads)
