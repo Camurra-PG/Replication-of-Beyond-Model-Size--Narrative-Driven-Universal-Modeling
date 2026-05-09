@@ -7,7 +7,7 @@ import os; os.environ["SKIP_URL_GRAPH"] = "1"
 # 1) On détecte automatiquement  le nombre de vCPU (sur a2-highgpu-1g → 12)
 n_threads = multiprocessing.cpu_count()
 print(f"n_threads:{n_threads}")
-
+# For BLAS / OpenMP back-ends
 os.environ["OPENBLAS_NUM_THREADS"]  = "12"
 os.environ["MKL_NUM_THREADS"]       = str(n_threads)
 os.environ["NUMEXPR_MAX_THREADS"]   = str(n_threads)
@@ -2409,18 +2409,16 @@ class AdvancedUBMGenerator:
         df = df.sort(['client_id','timestamp'])
         
         # Calcul vectorisé des sessions
+        time_diff = df.select([
+            pl.col('client_id'),
+            pl.col('timestamp').diff().over('client_id').dt.total_seconds() / 60
+        ])
+        
         df = df.with_columns(
-            (
-                pl.col('timestamp').diff().over('client_id').dt.total_seconds() / 60
-            ).alias('time_diff_min')
-        )
-
-        df = df.with_columns(
-            (
-                ((pl.col('time_diff_min') > 30) | pl.col('time_diff_min').is_null())
-                .cum_sum()
-                .over('client_id')
-            ).alias('session_id')
+            ((time_diff['timestamp'] > 30) | time_diff['timestamp'].is_null())
+            .cum_sum()
+            .over('client_id')
+            .alias('session_id')
         )
         
         # 5. Compter les paires par chunks pour éviter OOM
@@ -4296,13 +4294,6 @@ class TextRepresentationGenerator:
                 f.write("\n")
 
         logger.info("✅  Representations saved.")
-
-
-
-
-
-
-
 
 
 class CustomBehaviorFeatureExtractor(FeatureExtractorBase):
