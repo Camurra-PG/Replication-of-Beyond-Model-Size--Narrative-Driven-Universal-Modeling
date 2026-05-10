@@ -355,11 +355,11 @@ def main():
                        help="Mode DEBUG → Only 5 client ids")
     
     # Configuration threads
-    os.environ["OMP_NUM_THREADS"] = "1"
-    os.environ["MKL_NUM_THREADS"] = "1"
-    os.environ["NUMEXPR_MAX_THREADS"] = "1"
-    os.environ["OPENBLAS_NUM_THREADS"] = "1"
-    os.environ["POLARS_MAX_THREADS"] = "8"
+    os.environ["OMP_NUM_THREADS"] = "4"
+    os.environ["MKL_NUM_THREADS"] = "4"
+    os.environ["NUMEXPR_MAX_THREADS"] = "4"
+    os.environ["OPENBLAS_NUM_THREADS"] = "4"
+    os.environ["POLARS_MAX_THREADS"] = "4"
     os.environ["SKIP_URL_GRAPH"] = "1"
     
     args = parser.parse_args()
@@ -380,7 +380,7 @@ def main():
         
 
     BATCH_SIZE = 1000
-    N_WORKERS = min(8, mp.cpu_count() // 2)
+    N_WORKERS = min(16, mp.cpu_count() // 2)
 
     print(f"Configuration:")
     print(f"- Batch size: {BATCH_SIZE}")

@@ -8,17 +8,15 @@ import os; os.environ["SKIP_URL_GRAPH"] = "1"
 n_threads = multiprocessing.cpu_count()
 print(f"n_threads:{n_threads}")
 # For BLAS / OpenMP back-ends
-os.environ["OPENBLAS_NUM_THREADS"]  = "12"
-os.environ["MKL_NUM_THREADS"]       = str(n_threads)
-os.environ["NUMEXPR_MAX_THREADS"]   = str(n_threads)
-os.environ["OMP_NUM_THREADS"]       = str(n_threads)
-
-# Polars (already set in your file – keep it!)
-os.environ["POLARS_MAX_THREADS"]    = str(n_threads)
+os.environ["OPENBLAS_NUM_THREADS"]  = "4"
+os.environ["MKL_NUM_THREADS"]       = "4"
+os.environ["NUMEXPR_MAX_THREADS"]   = "4"
+os.environ["OMP_NUM_THREADS"]       = "4"
+os.environ["POLARS_MAX_THREADS"]    = "4"
 import unsloth
 # NetworKit – needs an explicit call
 import networkit as nk
-nk.setNumberOfThreads(n_threads)
+nk.setNumberOfThreads(4)
 import pyarrow.parquet as pq  
 import math             #  ← NEW
 import statistics        #  ← NEW

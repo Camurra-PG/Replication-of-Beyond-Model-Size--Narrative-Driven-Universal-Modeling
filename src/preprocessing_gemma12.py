@@ -294,12 +294,11 @@ def generate_complete_features_batch(client_batch: List[int], batch_id: int) -> 
             traceback.print_exc()
             return {cid: {"status": "batch_error", "error": str(e)[:500]} for cid in client_batch}
         
-# --- Thread Configuration ---
-os.environ["OMP_NUM_THREADS"] = "1"
-os.environ["MKL_NUM_THREADS"] = "1"
-os.environ["NUMEXPR_MAX_THREADS"] = "1"
-os.environ["OPENBLAS_NUM_THREADS"] = "1"
-os.environ["POLARS_MAX_THREADS"] = "8"
+os.environ["OMP_NUM_THREADS"] = "4"
+os.environ["MKL_NUM_THREADS"] = "4"
+os.environ["NUMEXPR_MAX_THREADS"] = "4"
+os.environ["OPENBLAS_NUM_THREADS"] = "4"
+os.environ["POLARS_MAX_THREADS"] = "4"
 os.environ["SKIP_URL_GRAPH"] = "1"
 
 # ── TEST MODE ────────────────────────────────────────────────────────────
@@ -320,7 +319,7 @@ else:
 
 # --- Generation Configuration ---
 BATCH_SIZE = 1000
-N_WORKERS = min(8, mp.cpu_count() // 2)
+N_WORKERS = min(16, mp.cpu_count() // 2)
 
 print("Configuration:")
 print(f"- Batch size: {BATCH_SIZE}")
