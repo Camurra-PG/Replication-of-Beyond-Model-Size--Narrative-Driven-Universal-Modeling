@@ -1947,7 +1947,20 @@ class AdvancedUBMGenerator:
             )
 
             # Optional filtering for fast local tests.
-                        # Optional filtering for fast local tests.
+            # Dataset-relative reference time must be computed before optional
+            # debug filtering, otherwise each test user appears artificially recent.
+            reference_df = (
+                lf_all
+                .select(pl.col("timestamp").max().alias("reference_time"))
+                .collect(engine="streaming")
+            )
+            self.reference_time = reference_df["reference_time"][0]
+
+            self.logger.info(
+                f"Retailrocket global reference time set to {self.reference_time}"
+            )
+
+            # Optional filtering for fast local tests.
             if relevant_client_ids is not None:
                 self.logger.info(
                     f"Filtering Retailrocket events to {len(relevant_client_ids)} clients"
@@ -2013,29 +2026,24 @@ class AdvancedUBMGenerator:
 
             self.lazy_all = lf_all
 
-            reference_df = (
-                self.lazy_all
-                .select(pl.col("timestamp").max().alias("reference_time"))
-                .collect(engine="streaming")
-            )
-            self.reference_time = reference_df["reference_time"][0]
-
-            self.logger.info(
-                f"Retailrocket reference time set to {self.reference_time}"
-            )
-
             # Calculate global statistics.
             self._compute_global_statistics()
     
             # En mode debug, matérialiser immédiatement
             if self.debug_mode and relevant_client_ids is not None:
-                self.logger.debug(f"DEBUG: materializing events_df pour {len(relevant_client_ids)} clients")
+                self.logger.debug(
+                    f"DEBUG: materializing events_df for {len(relevant_client_ids)} clients"
+                )
                 self.events_df = (
                     self.lazy_all
                     .filter(pl.col("client_id").is_in(relevant_client_ids))
                     .sort(["client_id", "timestamp"])
-                    .collect(engine='streaming')
+                    .collect(engine="streaming")
                 )
+
+                # Required for correct buyer/browser labels in debug profiles.
+                self._segment_users()
+
                 return
                 
             # Clustering et autres calculs globaux (seulement si pas en debug)
@@ -2958,10 +2966,17 @@ class AdvancedUBMGenerator:
     
         # 7) Further sub-segmentation
         try:
-            self._segment_users_by_price_sensitivity(df)
-            self._segment_users_by_category_behavior(df)
+            schema = self.lazy_all.collect_schema()
+
+            # Retailrocket currently has no validated price_bucket column.
+            if "price_bucket" in schema:
+                self._segment_users_by_price_sensitivity(df)
+
+            if "category_id" in schema:
+                self._segment_users_by_category_behavior(df)
+
         except Exception as e:
-            self.logger.error(f"Err price/cat segmentation: {e}")
+            self.logger.error(f"Err additional segmentation: {e}")
     
         self.logger.info(
             f"User segmentation done: Buyers={len(segs['buyers'])}, "
@@ -3090,8 +3105,15 @@ class AdvancedUBMGenerator:
                     self._extractors['price'] = PriceFeatureExtractor(self)
                 if self.product_popularity is not None:
                     self._extractors['social'] = SocialFeatureExtractor(self)
-                if self.sku_properties_dict:
-                    self._extractors['name_embedding'] = NameEmbeddingExtractor(self)
+                has_name_embeddings = any(
+                    isinstance(props.get("name"), str)
+                    and props["name"].startswith("[")
+                    and props["name"].endswith("]")
+                    for props in self.sku_properties_dict.values()
+                )
+
+                if has_name_embeddings:
+                    self._extractors["name_embedding"] = NameEmbeddingExtractor(self)
                 if hasattr(self, 'sku_cluster_map'):
                     self._extractors['custom_behavior'] = CustomBehaviorFeatureExtractor(self)
 
@@ -3683,6 +3705,10 @@ class AdvancedUBMGenerator:
             section_map["OVERVIEW"].extend(overview_sec)
             features_json: list[dict[str, str]] = []
             features_list = []
+
+            # Additional compact behavioral metrics for the textual profile.
+            extra_tags = self._compute_extra_short_metrics(cid, events, now)
+            compact_tags = self._compute_compact_metrics(events)
             # where to dump each extractor's lines → logical section name
             ex_to_sec = {
                 "temporal":         "TEMPORAL",
