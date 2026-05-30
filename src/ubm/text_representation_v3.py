@@ -720,17 +720,34 @@ class SequenceFeatureExtractor(FeatureExtractorBase):
             total_starts = views + searches
             if total_starts > 0: funnel_stages.append(f"  Starts (View/Search): {total_starts}")
             if cart_adds > 0:
-                cart_rate = (cart_adds / total_starts) * 100 if total_starts > 0 else 0
-                funnel_stages.append(f"  Cart Adds: {cart_adds} ({cart_rate:.1f}% of starts)")
+                if total_starts > 0:
+                    cart_rate = (cart_adds / total_starts) * 100
+                    funnel_stages.append(
+                        f"  Cart Adds: {cart_adds} ({cart_rate:.1f}% of starts)"
+                    )
+                else:
+                    funnel_stages.append(
+                        f"  Cart Adds: {cart_adds} (no preceding view observed)"
+                    )
+
                 if purchases > 0:
                     purchase_rate_from_cart = (purchases / cart_adds) * 100
-                    funnel_stages.append(f"  Purchases: {purchases} ({purchase_rate_from_cart:.1f}% of cart adds)")
-                    purchase_rate_from_start = (purchases / total_starts) * 100 if total_starts > 0 else 0
-                    funnel_stages.append(f"  Overall Conversion: {purchase_rate_from_start:.2f}% from start")
+                    funnel_stages.append(
+                        f"  Purchases: {purchases} "
+                        f"({purchase_rate_from_cart:.1f}% of cart adds)"
+                    )
+
+                    if total_starts > 0:
+                        purchase_rate_from_start = (purchases / total_starts) * 100
+                        funnel_stages.append(
+                            f"  Overall Conversion: "
+                            f"{purchase_rate_from_start:.2f}% from start"
+                        )
             elif purchases > 0:
                 funnel_stages.append(f"  Purchases: {purchases} (direct or uncaptured cart add)")
 
-            if len(funnel_stages) > 1: features.extend(funnel_stages)
+            if len(funnel_stages) > 1:
+                features.append("\n".join(funnel_stages))
         except Exception as e:
             self.logger.debug(f"Error extracting purchase funnel: {e}")
             features.append("Error extracting purchase funnel")
@@ -840,11 +857,25 @@ class GraphFeatureExtractor(FeatureExtractorBase):
                 features.append(f"Dominant cat (PR): CAT_{top_cat} ({scores[top_idx]:.3f})")
 
             # ------------------------------------------------------------------
-            # 3) Average clustering coefficient (undirected view)
-            lu = nk.clustering.LocalClusteringCoefficient(g.toUndirected(), weighted=True)
-            lu.run()
-            avg_clust = sum(lu.scores()) / g.numberOfNodes()
-            features.append(f"Avg cat clustering: {avg_clust:.3f}")
+            # 3) Average clustering coefficient, where supported by NetworKit.
+            # Some local NetworKit versions do not expose nk.clustering.
+            try:
+                if hasattr(nk, "clustering") and hasattr(
+                    nk.clustering, "LocalClusteringCoefficient"
+                ):
+                    lu = nk.clustering.LocalClusteringCoefficient(
+                        g.toUndirected(), weighted=True
+                    )
+                    lu.run()
+                    avg_clust = sum(lu.scores()) / g.numberOfNodes()
+                    features.append(f"Avg cat clustering: {avg_clust:.3f}")
+            except Exception as exc:
+                self.logger.debug(
+                    f"Category clustering coefficient skipped: {exc}"
+                )
+
+            # ------------------------------------------------------------------
+            # 4) Top transition (weight ≥ 2)
 
             # ------------------------------------------------------------------
             # 4) Top transition (weight ≥ 2)
