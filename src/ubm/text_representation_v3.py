@@ -1,7 +1,7 @@
 # ubm/text_representation_v3.py
 
 from __future__ import annotations
-import unsloth
+# import unsloth
 import os, multiprocessing
 import os; os.environ["SKIP_URL_GRAPH"] = "1"
 # 1) On détecte automatiquement  le nombre de vCPU (sur a2-highgpu-1g → 12)
@@ -13,7 +13,7 @@ os.environ["MKL_NUM_THREADS"]       = "4"
 os.environ["NUMEXPR_MAX_THREADS"]   = "4"
 os.environ["OMP_NUM_THREADS"]       = "4"
 os.environ["POLARS_MAX_THREADS"]    = "4"
-import unsloth
+#import unsloth
 # NetworKit – needs an explicit call
 import networkit as nk
 nk.setNumberOfThreads(4)
@@ -51,8 +51,8 @@ from sklearn.cluster import MiniBatchKMeans
 from collections import Counter
 from math import log2
 import networkit as nk
-from networkit import embedding as nk_embed      # NetworKit’s fast Node2Vec
-from .portrait_generator import PortraitGenerator, generate_portraits
+# from networkit import embedding as nk_embed      # NetworKit’s fast Node2Vec
+#from .portrait_generator import PortraitGenerator, generate_portraits
 print("Polars pool size:", pl.threadpool_size())
 from math import isfinite
 pl.enable_string_cache()
@@ -1697,18 +1697,10 @@ class AdvancedUBMGenerator:
         self.global_stats: Dict[str, Any] = {}
         self.user_segments: Dict[str, List[int]] = {}
         self._extractors: Dict[str, Any] = {}
+        # Retailrocket has no predefined Synerise propensity target lists.
+        # We will derive popular SKUs and categories from training data later.  
         self.top_skus: list[int] = []
-        try:
-            # ex : array([123, 456, …])
-            self.top_skus = list(np.load(self.data_dir / "target/propensity_sku.npy"))
-        except Exception:
-            self.logger.warning("Top-SKU list not found – SKU_PROPENSITY features disabled")
-
         self.top_categories: list[int] = []
-        try:
-            self.top_categories = list(np.load(self.data_dir / "target/propensity_category.npy"))
-        except Exception:
-            self.logger.warning("Top-category list not found – CAT_PROPENSITY features disabled")
 
 
         self.logger = logging.getLogger(self.__class__.__name__)
@@ -1901,170 +1893,125 @@ class AdvancedUBMGenerator:
             self.logger.info(f"=== load_data called with use_cache={use_cache}, "
                              f"relevant_clients={len(relevant_client_ids) if relevant_client_ids else 'None'}")
             
-            # 1. Déterminer quel fichier cache utiliser
-            if relevant_client_ids is not None and len(relevant_client_ids) <= 1_000_000:
-                cache_file = self.cache_dir / "events_1m_clients.parquet"
-                self.logger.info(f"Using filtered cache for 1M clients")
-            else:
-                cache_file = self.cache_dir / "all_events_processed.parquet"
-                self.logger.info(f"Using full cache")
-            
-            # if self.debug_mode and relevant_client_ids and len(relevant_client_ids) < 100:
-            #     # En mode debug avec peu de clients, filtrer aussi les SKU properties
-            #     if 'sku' in df.columns:
-            #         client_skus = set(df['sku'].drop_nulls().unique().to_list())
-            
-            # 3. Essayer de charger depuis le cache
-            if use_cache and cache_file.exists():
-                try:
-                    self.logger.info(f"Loading events cache: {cache_file}")
-                    
-                    # Vérifier que les stats globales existent (sauf en debug)
-                    if not self.debug_mode and not (self.cache_dir / "global_stats.json").exists():
-                        self.logger.warning("Global stats missing - need to recompute")
-                        self._reset_data()
-                    else:
-                        # Charger le cache events
-                        df = pl.read_parquet(cache_file)
-                        
-                        # ✅ FIX #1 : TOUJOURS filtrer si relevant_client_ids est fourni
-                        if relevant_client_ids is not None:
-                            original_height = df.height
-                            self.logger.info(f"Filtering {original_height:,} events to {len(relevant_client_ids)} clients...")
-                            df = df.filter(pl.col("client_id").is_in(relevant_client_ids))
-                            self.logger.info(f"After filtering: {df.height:,} events (reduced by {original_height - df.height:,})")
-                            
-                            # Si après filtrage on a 0 events, logger un warning
-                            if df.height == 0:
-                                self.logger.warning(f"No events found for clients {relevant_client_ids[:5]}...")
-                        
-                        # Charger les stats calculées
-                        if self._load_calculated_data_from_cache() and df.height > 0:
-                            self.events_df = df
-                            
-                            # ✅ FIX #3 : Réduire les SKU properties en mode debug
-                            if self.debug_mode and relevant_client_ids and len(relevant_client_ids) < 100:
-                                if 'sku' in df.columns and hasattr(self, 'sku_properties_dict') and self.sku_properties_dict:
-                                    # Récupérer les SKUs utilisés par ces clients
-                                    client_skus = set(df['sku'].drop_nulls().unique().to_list())
-                                    
-                                    # Filtrer le dictionnaire des SKU properties
-                                    filtered_dict = {
-                                        k: v for k, v in self.sku_properties_dict.items() 
-                                        if k in client_skus
-                                    }
-                                    
-                                    old_size = len(self.sku_properties_dict)
-                                    self.sku_properties_dict = filtered_dict
-                                    
-                                    self.logger.info(f"Debug mode: Reduced SKU properties from {old_size:,} to {len(self.sku_properties_dict):,}")
-                                    
-                                    # Libérer la mémoire
-                                    import gc
-                                    gc.collect()
-                            
-                            self.logger.info(f"Loaded all data from cache. Events shape: {df.shape}")
-                            return  # ← SUCCESS ! On sort ici
-                        
-                        self.logger.warning("Cache incomplete or empty → reloading from source.")
-                        self._reset_data()
-                        
-                except Exception as e:
-                    self.logger.warning(f"Failed loading cache ({e}) → reloading from source.")
-                    self._reset_data()
-            
+                        # ============================================================
+            # Load Retailrocket source data
             # ============================================================
-            # Si on arrive ici, on doit charger depuis les fichiers source
-            # ============================================================
-            self.logger.info("Loading from source files...")
-            
-            # Charger les propriétés des produits
-            props_path = self.data_dir / "product_properties.parquet"
-            if props_path.exists():
-                prop = pl.read_parquet(props_path)
-                emb_source = None
-                
-                # Détecter la colonne d'embedding
-                if "embedding" in prop.columns:
-                    emb_source = "embedding"
-                elif "name" in prop.columns and prop["name"].head(1)[0].strip().startswith("["):
-                    emb_source = "name"
-    
-                # Sélectionner et renommer les colonnes
-                cols = ["sku", "category", "price"] + ([emb_source] if emb_source else [])
-                tmp = prop.select(cols)
-                rename_map = {"category": "category_id", "price": "price_bucket"}
-                if emb_source:
-                    rename_map[emb_source] = "emb_str"
-                    
-                self.sku_properties_for_join = tmp.rename(rename_map).with_columns(pl.col("sku").cast(pl.Int64))
-                self.sku_properties_dict = {
-                    int(r["sku"]): {k:v for k,v in r.items() if k!="sku"}
-                    for r in prop.to_dicts() if r.get("sku") is not None
-                }
-                self.logger.info(f"Loaded {len(self.sku_properties_dict)} product properties.")
-            else:
-                self.logger.warning("No properties file → skipping embedding joins.")
-    
-            # Construire les lazy scans pour chaque type d'événement
-            event_types = ["product_buy", "add_to_cart", "remove_from_cart", "page_visit", "search_query"]
-            schema = {
-                "client_id": pl.Int64,
-                "timestamp": pl.Datetime("us"),
-                "sku": pl.Int64,
-                "url": pl.Utf8,
-                "query": pl.Utf8
-            }
-    
-            lazy_sources = []
-            for et in event_types:
-                fp = self.data_dir / f"{et}.parquet"
-                if not fp.exists():
-                    self.logger.warning(f"Skipping missing file {fp}")
-                    continue
-                    
-                scan = pl.scan_parquet(fp)
-                lf_schema = scan.collect_schema()
-                exprs = []
-                
-                # Harmoniser les colonnes
-                for col, dt in schema.items():
-                    if col in lf_schema:
-                        col_expr = pl.col(col)
-                        if lf_schema[col] != dt:
-                            if col == "timestamp":
-                                col_expr = col_expr.cast(pl.Utf8).str.to_datetime(strict=False, time_unit="us").cast(dt)
-                            else:
-                                col_expr = col_expr.cast(dt, strict=False)
-                        exprs.append(col_expr.alias(col))
-                    else:
-                        exprs.append(pl.lit(None).cast(dt).alias(col))
-                        
-                exprs.append(pl.lit(et).alias("event_type"))
-                lazy_sources.append(scan.select(exprs))
-    
-            if not lazy_sources:
-                raise ValueError("No event files found.")
-    
-            # Union de tous les événements
-            lf_all = pl.concat(lazy_sources)
-    
-            # Joindre les propriétés des produits
-            if self.sku_properties_for_join is not None:
-                lf_all = lf_all.join(
-                    self.sku_properties_for_join.lazy(),
-                    on="sku",
-                    how="left"
+            self.logger.info("Loading Retailrocket source files...")
+
+            events_path = self.data_dir / "events.csv"
+
+            if not events_path.exists():
+                raise FileNotFoundError(
+                    f"Retailrocket events file not found: {events_path}"
                 )
-    
-            # Filtrer en mode debug
-            if self.debug_mode and relevant_client_ids is not None:
-                self.logger.debug(f"DEBUG: filtrage lazy sur {len(relevant_client_ids)} clients")
-                lf_all = lf_all.filter(pl.col("client_id").is_in(relevant_client_ids))
-    
-            # Stocker le pipeline lazy
+
+            # Retailrocket raw schema:
+            # timestamp, visitorid, event, itemid, transactionid
+            #
+            # Internal schema retained for the existing feature extractors:
+            # client_id, timestamp, sku, event_type, transaction_id, url, query
+            lf_all = (
+                pl.scan_csv(events_path)
+                .select([
+                    pl.col("visitorid")
+                      .cast(pl.Int64)
+                      .alias("client_id"),
+
+                    pl.from_epoch(
+                        pl.col("timestamp").cast(pl.Int64),
+                        time_unit="ms"
+                    ).alias("timestamp"),
+
+                    pl.col("itemid")
+                      .cast(pl.Int64)
+                      .alias("sku"),
+
+                    pl.when(pl.col("event") == "view")
+                      .then(pl.lit("page_visit"))
+                      .when(pl.col("event") == "addtocart")
+                      .then(pl.lit("add_to_cart"))
+                      .when(pl.col("event") == "transaction")
+                      .then(pl.lit("product_buy"))
+                      .otherwise(pl.col("event"))
+                      .cast(pl.Categorical)
+                      .alias("event_type"),
+
+                    pl.col("transactionid")
+                      .cast(pl.Int64, strict=False)
+                      .alias("transaction_id"),
+
+                    # Retailrocket does not provide URL or search-query events.
+                    pl.lit(None).cast(pl.Utf8).alias("url"),
+                    pl.lit(None).cast(pl.Utf8).alias("query"),
+                ])
+            )
+
+            # Optional filtering for fast local tests.
+                        # Optional filtering for fast local tests.
+            if relevant_client_ids is not None:
+                self.logger.info(
+                    f"Filtering Retailrocket events to {len(relevant_client_ids)} clients"
+                )
+                lf_all = lf_all.filter(
+                    pl.col("client_id").is_in(relevant_client_ids)
+                )
+
+            # ============================================================
+            # Load Retailrocket item categories
+            # ============================================================
+            properties_paths = [
+                self.data_dir / "item_properties_part1.csv",
+                self.data_dir / "item_properties_part2.csv",
+            ]
+
+            missing_property_files = [
+                str(path) for path in properties_paths if not path.exists()
+            ]
+            if missing_property_files:
+                raise FileNotFoundError(
+                    "Missing Retailrocket item-properties files: "
+                    + ", ".join(missing_property_files)
+                )
+
+            category_properties = (
+                pl.concat([
+                    pl.scan_csv(properties_paths[0]),
+                    pl.scan_csv(properties_paths[1]),
+                ])
+                .filter(pl.col("property") == "categoryid")
+                .select([
+                    pl.col("itemid").cast(pl.Int64).alias("sku"),
+                    pl.col("timestamp").cast(pl.Int64).alias("property_timestamp"),
+                    pl.col("value").cast(pl.Int64, strict=False).alias("category_id"),
+                ])
+                .filter(pl.col("category_id").is_not_null())
+                .sort("property_timestamp")
+                .group_by("sku")
+                .agg(
+                    pl.col("category_id").last().alias("category_id")
+                )
+                .collect(engine="streaming")
+            )
+
+            self.logger.info(
+                f"Loaded latest category assignments for "
+                f"{category_properties.height:,} items."
+            )
+
+            self.sku_properties_for_join = category_properties
+            self.sku_properties_dict = {
+                int(row["sku"]): {"category": int(row["category_id"])}
+                for row in category_properties.iter_rows(named=True)
+                if row["sku"] is not None and row["category_id"] is not None
+            }
+
+            lf_all = lf_all.join(
+                category_properties.lazy(),
+                on="sku",
+                how="left",
+            )
+
             self.lazy_all = lf_all
-    
             # Calculer les statistiques globales
             self._compute_global_statistics()
     
@@ -4237,6 +4184,8 @@ class TextRepresentationGenerator:
 
 
         # 4) Ask the LLM for plain-text bullet portraits
+        from .portrait_generator import generate_portraits
+
         portraits = generate_portraits(stripped_texts)
 
         # 5) Merge summary, portrait & RAW_SEQUENCE into one plain-text blob
