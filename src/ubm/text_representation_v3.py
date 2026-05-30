@@ -2012,7 +2012,19 @@ class AdvancedUBMGenerator:
             )
 
             self.lazy_all = lf_all
-            # Calculer les statistiques globales
+
+            reference_df = (
+                self.lazy_all
+                .select(pl.col("timestamp").max().alias("reference_time"))
+                .collect(engine="streaming")
+            )
+            self.reference_time = reference_df["reference_time"][0]
+
+            self.logger.info(
+                f"Retailrocket reference time set to {self.reference_time}"
+            )
+
+            # Calculate global statistics.
             self._compute_global_statistics()
     
             # En mode debug, matérialiser immédiatement
@@ -2317,7 +2329,7 @@ class AdvancedUBMGenerator:
             .to_list()
         )
         
-        sample_size = min(100_000, len(all_clients) // 10)
+        sample_size = min(100_000, max(1, len(all_clients) // 10))
         sampled_clients = np.random.choice(all_clients, sample_size, replace=False)
         
         print(f"Sampling {sample_size:,} clients out of {len(all_clients):,}")
@@ -2571,7 +2583,7 @@ class AdvancedUBMGenerator:
               .agg(pl.max('timestamp').alias('last_purchase_ts'))
         )
         df = recs_lf.collect(engine='streaming')
-        now_ts = datetime.now()
+        now_ts = self.reference_time or datetime.now()
         recs = [ (now_ts - row['last_purchase_ts']).days 
                  for row in df.to_dicts() if row['last_purchase_ts']]
         self.global_stats['rfm_recencies'] = np.array(recs, dtype=int)
@@ -2664,13 +2676,16 @@ class AdvancedUBMGenerator:
               )
         ).collect(engine='streaming')
         
-        stats = df.group_by("sid").agg([
+        stats = df.group_by(["client_id", "sid"]).agg([
             pl.col("timestamp").min().alias("start"),
             pl.col("timestamp").max().alias("end"),
-            pl.col("sid").count().alias("count")  # Utiliser pl.col().count()
+            pl.len().alias("count")
         ]).with_columns(
-            ((pl.col("end")-pl.col("start")).dt.total_seconds()/60).alias("duration_min")
+            (
+                (pl.col("end") - pl.col("start")).dt.total_seconds() / 60
+            ).alias("duration_min")
         )
+        
         
         if stats.height>0:
             agg = stats.select([
@@ -2895,7 +2910,7 @@ class AdvancedUBMGenerator:
             max_ts = datetime.now()
     
         # **Plus besoin de collect(engine='streaming') ici : df est déjà un DataFrame**
-        now = datetime.now()
+        now = self.reference_time or max_ts
         df = df.with_columns([
             pl.Series(
                 "days_since_run",
@@ -3193,7 +3208,8 @@ class AdvancedUBMGenerator:
         # --- NEW: how-many-days-ago bucket (coarse) ------------------
         if ts := event_row.get('timestamp'):
             if isinstance(ts, datetime):
-                days_ago = (datetime.now() - ts).days
+                reference_time = self.reference_time or datetime.now()
+                days_ago = (reference_time - ts).days
                 if   days_ago <= 1:      parts.append("AGE:[D_0-1]")
                 elif days_ago <= 7:      parts.append("AGE:[D_1-7]")
                 elif days_ago <= 30:     parts.append("AGE:[D_7-30]")
@@ -3633,7 +3649,7 @@ class AdvancedUBMGenerator:
         # ========================================================
         # GARDEZ TOUT LE CODE ORIGINAL À PARTIR D'ICI !
         # ========================================================
-        now = datetime.now()
+        now = self.reference_time or datetime.now()
         extractors = self.get_feature_extractors()
         reps: dict[int, str] = {}
         

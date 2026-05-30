@@ -4,26 +4,55 @@ import polars as pl
 
 from src.ubm.text_representation_v3 import AdvancedUBMGenerator
 
-# Project root = folder in which this test file is located.
+# ------------------------------------------------------------
+# Paths
+# ------------------------------------------------------------
 PROJECT_ROOT = Path(__file__).resolve().parent
 DATA_DIR = PROJECT_ROOT / "retailrocket_data"
-
-events_path = DATA_DIR / "events.csv"
+EVENTS_PATH = DATA_DIR / "events.csv"
 
 print("Project root:", PROJECT_ROOT)
 print("Data directory:", DATA_DIR)
-print("Events file:", events_path)
-print("Events file exists:", events_path.exists())
+print("Events file:", EVENTS_PATH)
+print("Events file exists:", EVENTS_PATH.exists())
 
-if not events_path.exists():
-    raise FileNotFoundError(f"Retailrocket events.csv not found: {events_path}")
+if not EVENTS_PATH.exists():
+    raise FileNotFoundError(f"Retailrocket events.csv not found: {EVENTS_PATH}")
 
-# Read a few real visitor IDs directly from Retailrocket.
-sample_events = pl.read_csv(events_path).head(100)
-test_client_ids = sample_events["visitorid"].unique().head(5).to_list()
+# ------------------------------------------------------------
+# Select users who definitely contain transaction events
+# ------------------------------------------------------------
+raw_events = pl.scan_csv(EVENTS_PATH)
+
+transaction_clients = (
+    raw_events
+    .filter(pl.col("event") == "transaction")
+    .select("visitorid")
+    .unique()
+    .limit(3)
+    .collect()["visitorid"]
+    .to_list()
+)
+
+cart_clients = (
+    raw_events
+    .filter(pl.col("event") == "addtocart")
+    .select("visitorid")
+    .unique()
+    .limit(2)
+    .collect()["visitorid"]
+    .to_list()
+)
+
+test_client_ids = list(dict.fromkeys(transaction_clients + cart_clients))
 
 print("Testing visitor IDs:", test_client_ids)
+print("Transaction visitor IDs:", transaction_clients)
+print("Cart visitor IDs:", cart_clients)
 
+# ------------------------------------------------------------
+# Load through the adapted Retailrocket loader
+# ------------------------------------------------------------
 generator = AdvancedUBMGenerator(
     data_dir=str(DATA_DIR),
     cache_dir=str(DATA_DIR / "cache_test"),
@@ -37,27 +66,50 @@ generator.load_data(
 
 print("\nLazy pipeline created successfully.")
 
-df = generator.lazy_all.sort(["client_id", "timestamp"]).collect()
+df = (
+    generator.lazy_all
+    .sort(["client_id", "timestamp"])
+    .collect()
+)
 
+# ------------------------------------------------------------
+# Inspect schema and mapping results
+# ------------------------------------------------------------
 print("\nColumns:")
 print(df.columns)
 
 print("\nShape:")
 print(df.shape)
 
-print("\nEvent types:")
-print(df["event_type"].unique().to_list())
+print("\nEvent count by type:")
+for row in (
+    df.group_by("event_type")
+      .agg(pl.len().alias("count"))
+      .sort("event_type")
+      .to_dicts()
+):
+    print(row)
 
 print("\nFirst rows as dictionaries:")
-for row in df.head().to_dicts():
+for row in df.head(5).to_dicts():
     print(row)
 
+print("\nPurchase rows:")
+purchase_rows = (
+    df.filter(pl.col("event_type") == "product_buy")
+      .select(["client_id", "timestamp", "sku", "transaction_id", "category_id"])
+      .head(10)
+      .to_dicts()
+)
 
-print("\nRows with category IDs:")
-for row in df.select(
-    ["client_id", "sku", "event_type", "category_id"]
-).head().to_dicts():
+for row in purchase_rows:
     print(row)
+
+print("\nNumber of mapped purchase rows:")
+print(len(df.filter(pl.col("event_type") == "product_buy")))
 
 print("\nEvents with known category:")
 print(df.filter(pl.col("category_id").is_not_null()).height)
+
+print("\nReference time:")
+print(generator.reference_time)
