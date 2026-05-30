@@ -3204,18 +3204,26 @@ class AdvancedUBMGenerator:
 
         props = self.sku_properties_dict.get(int(sku), {}) if sku is not None else {}
         etype = event_row['event_type']
-        if etype in ('product_buy', 'add_to_cart', 'remove_from_cart') and sku is not None:
+        if etype in ('page_visit', 'add_to_cart', 'product_buy') and sku is not None:
             parts.append(f"SKU:[SKU_{int(sku)}]")
-            if etype != 'remove_from_cart':
-                cat = props.get('category'); price = props.get('price')
-                if cat is not None: parts.append(f"CAT:[CAT_{cat}]")
-                if price is not None: parts.append(f"PRICE:[PRICE_{price}]")
+
+            cat = event_row.get('category_id')
+            if cat is None:
+                cat = props.get('category')
+            if cat is not None:
+                parts.append(f"CAT:[CAT_{int(cat)}]")
+
+            price = props.get('price')
+            if price is not None:
+                parts.append(f"PRICE:[PRICE_{price}]")
+
             name_emb = props.get('name')
             if isinstance(name_emb, str) and name_emb.startswith('[') and name_emb.endswith(']'):
                 clean = name_emb.strip('[]').replace(',', ' ')
                 parts.append(f"NAME_EMB:[{clean}]")
+
         elif etype == 'page_visit' and event_row.get('url'):
-            parts.append(f"URL:[URL_{event_row['url']}]" )
+            parts.append(f"URL:[URL_{event_row['url']}]")
         elif etype == 'search_query' and event_row.get('query'):
             q = event_row['query']
             if isinstance(q, str) and q.startswith('[') and q.endswith(']'):
