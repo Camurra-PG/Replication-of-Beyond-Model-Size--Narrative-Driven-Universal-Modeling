@@ -44,6 +44,12 @@ print(generator.lazy_all is not None)
 print("\nEvents dataframe materialized:")
 print(generator.events_df is not None)
 
+assert generator.events_df is None, (
+    "Full-mode test failed: events_df was materialized. "
+    "Check that debug_mode=False and that load_data() only materializes "
+    "selected clients inside the debug-mode branch."
+)
+
 schema_columns = generator.lazy_all.collect_schema().names()
 
 print("\nLazy schema columns:")

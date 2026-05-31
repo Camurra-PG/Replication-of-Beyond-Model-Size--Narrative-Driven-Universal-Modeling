@@ -2239,15 +2239,39 @@ class AdvancedUBMGenerator:
             )
 
             self.lazy_all = lf_all
+            self._extractors = {}
 
-            # Calculate global statistics.
-            self._compute_global_statistics()
-    
-            # En mode debug, matérialiser immédiatement
+            # ============================================================
+            # Restore or compute derived Retailrocket statistics
+            # ============================================================
+            # Shared caches may only be reused for a full-history run.
+            # A temporal observation cutoff requires separate computation
+            # to prevent future information from entering the profile.
+            can_restore_shared_cache = (
+                use_cache
+                and not self.debug_mode
+                and observation_end is None
+            )
+
+            cache_loaded = False
+
+            if can_restore_shared_cache:
+                cache_loaded = self._load_calculated_data_from_cache(
+                    expected_reference_time=self.reference_time,
+                )
+
+            if not cache_loaded:
+                self._compute_global_statistics()
+
+            # ============================================================
+            # Debug mode: materialize only selected clients and stop here
+            # ============================================================
             if self.debug_mode and relevant_client_ids is not None:
                 self.logger.debug(
-                    f"DEBUG: materializing events_df for {len(relevant_client_ids)} clients"
+                    f"DEBUG: materializing events_df for "
+                    f"{len(relevant_client_ids)} clients"
                 )
+
                 self.events_df = (
                     self.lazy_all
                     .filter(pl.col("client_id").is_in(relevant_client_ids))
@@ -2257,30 +2281,41 @@ class AdvancedUBMGenerator:
 
                 # Required for correct buyer/browser labels in debug profiles.
                 self._segment_users()
-
                 return
-                
-            # Clustering et autres calculs globaux (seulement si pas en debug)
-            if self.sku_properties_for_join is not None and "emb_str" in self.sku_properties_for_join.columns:
-                self._cluster_sku_embeddings()
-            
-            self._build_url_graph_embeddings()
-            self._segment_users()
-            self._build_global_centralities()
-    
-            # Sauvegarder le cache en mode normal
-            if use_cache and not self.debug_mode:
-                if observation_end is None:
-                    self._save_calculated_data_to_cache()
-                    self.logger.info(
-                        "Saved derived Retailrocket statistics to cache. "
-                        "Event data remains lazy."
-                    )
-                else:
-                    self.logger.info(
-                        "Skipping shared derived-cache write for cutoff-based run "
-                        "to avoid mixing temporal evaluation states."
-                    )
+
+            # ============================================================
+            # Full-mode derived computations
+            # ============================================================
+            if not cache_loaded:
+                if (
+                    self.sku_properties_for_join is not None
+                    and "emb_str" in self.sku_properties_for_join.columns
+                ):
+                    self._cluster_sku_embeddings()
+
+                self._build_url_graph_embeddings()
+                self._segment_users()
+                self._build_global_centralities()
+
+                if use_cache and not self.debug_mode:
+                    if observation_end is None:
+                        self._save_calculated_data_to_cache()
+                        self.logger.info(
+                            "Saved derived Retailrocket statistics to cache. "
+                            "Event data remains lazy."
+                        )
+                    else:
+                        self.logger.info(
+                            "Skipping shared derived-cache write for "
+                            "cutoff-based run to avoid mixing temporal "
+                            "evaluation states."
+                        )
+            else:
+                self.logger.info(
+                    "Reusing cached Retailrocket derived features; "
+                    "skipping global statistics, segmentation, and "
+                    "centrality recomputation."
+                )
             
     def _collect_client_events(self, client_id: int) -> pl.DataFrame:
         """Pulls down only one client's events into memory."""
@@ -2507,12 +2542,23 @@ class AdvancedUBMGenerator:
             self.cat_centrality = {}
         else:
             arr = np.array(df.to_numpy(), dtype=int)
-            src, dst = arr[:,0], arr[:,1]
-            unique_edges, counts = np.unique(np.stack([src,dst],axis=1), axis=0, return_counts=True)
-            se, de = unique_edges[:,0], unique_edges[:,1]
+            src, dst = arr[:, 0], arr[:, 1]
+
+            unique_edges, counts = np.unique(
+                np.stack([src, dst], axis=1),
+                axis=0,
+                return_counts=True,
+            )
+
+            se, de = unique_edges[:, 0], unique_edges[:, 1]
             self.cat_centrality = compute_sparse_pagerank(se, de, counts)
 
-        self.logger.info(f"Built sparse category centrality • CAT:{len(self.cat_centrality)}")
+        # Existing helper methods use both names.
+        self.category_centrality = self.cat_centrality
+
+        self.logger.info(
+            f"Built sparse category centrality • CAT:{len(self.cat_centrality)}"
+        )
 
 
     # ------------------------------------------------------------------ #
@@ -2653,119 +2699,290 @@ class AdvancedUBMGenerator:
         
     # --- _save & _load calculated data (unchanged) ---
     def _save_calculated_data_to_cache(self) -> None:
+        """
+        Save derived Retailrocket statistics and graph features.
+
+        The raw event pipeline is intentionally not materialized here.
+        It is rebuilt lazily from the CSV files on each run, while expensive
+        derived statistics can be restored from this cache.
+        """
         if not self.cache_dir:
             return
+
         try:
-            # Prepare serializable stats
-            serializable_stats = {}
-            for k, v in self.global_stats.items():
-                if isinstance(v, np.ndarray):
-                    # Convert numpy arrays to lists for JSON serialization
-                    # Make sure to convert to native Python types
-                    serializable_stats[k] = [int(x) if isinstance(x, np.integer) else float(x) for x in v.tolist()]
-                elif isinstance(v, (int, float, str, bool, list, dict)):
-                    serializable_stats[k] = v
-                elif isinstance(v, (np.integer, np.floating)):
-                    # Convert numpy scalars to Python types
-                    serializable_stats[k] = v.item()
-                else:
-                    # For other types, convert to string
-                    serializable_stats[k] = str(v)
-            
-            # Save to JSON
-            with open(self.cache_dir / 'global_stats.json', 'w') as f:
-                json.dump(serializable_stats, f, indent=2)
-    
-            # Save user segments
-            serializable_segments = {
-                k: list(v) if isinstance(v, (set, list)) else v
-                for k, v in self.user_segments.items()
+            self.cache_dir.mkdir(parents=True, exist_ok=True)
+
+            # ------------------------------------------------------------
+            # Cache metadata: prevents accidental reuse for another setup.
+            # ------------------------------------------------------------
+            metadata = {
+                "cache_version": "retailrocket_full_v1",
+                "dataset_end": (
+                    self.dataset_end.isoformat()
+                    if self.dataset_end is not None
+                    else None
+                ),
+                "reference_time": (
+                    self.reference_time.isoformat()
+                    if self.reference_time is not None
+                    else None
+                ),
+                "dataset_type": "retailrocket",
             }
-            with open(self.cache_dir / 'user_segments.json', 'w') as f:
+
+            with open(
+                self.cache_dir / "retailrocket_cache_metadata.json",
+                "w",
+                encoding="utf-8",
+            ) as f:
+                json.dump(metadata, f, indent=2)
+
+            # ------------------------------------------------------------
+            # Global statistics
+            # ------------------------------------------------------------
+            serializable_stats = {}
+
+            for key, value in self.global_stats.items():
+                if isinstance(value, np.ndarray):
+                    serializable_stats[key] = value.tolist()
+                elif isinstance(value, (np.integer, np.floating)):
+                    serializable_stats[key] = value.item()
+                else:
+                    serializable_stats[key] = value
+
+            with open(
+                self.cache_dir / "global_stats.json",
+                "w",
+                encoding="utf-8",
+            ) as f:
+                json.dump(serializable_stats, f, indent=2)
+
+            # ------------------------------------------------------------
+            # User segments
+            # ------------------------------------------------------------
+            serializable_segments = {
+                key: list(value) if isinstance(value, (set, list)) else value
+                for key, value in self.user_segments.items()
+            }
+
+            with open(
+                self.cache_dir / "user_segments.json",
+                "w",
+                encoding="utf-8",
+            ) as f:
                 json.dump(serializable_segments, f)
-    
-            # Save dataframes
+
+            # ------------------------------------------------------------
+            # Popularity tables
+            # ------------------------------------------------------------
             if self.product_popularity is not None:
                 self.product_popularity.write_parquet(
-                    self.cache_dir / 'product_popularity.parquet'
+                    self.cache_dir / "product_popularity.parquet"
                 )
+
             if self.category_popularity is not None:
                 self.category_popularity.write_parquet(
-                    self.cache_dir / 'category_popularity.parquet'
+                    self.cache_dir / "category_popularity.parquet"
                 )
-    
-            # Save SKU properties dict
-            with open(self.cache_dir / 'sku_properties_dict.pkl', 'wb') as f:
-                pickle.dump(self.sku_properties_dict, f)
-    
-            self.logger.info("Calculated data saved to cache.")
-        except Exception as e:
-            self.logger.error(f"Failed to save calculated data: {e}", exc_info=True)
 
-    def _load_calculated_data_from_cache(self) -> bool:
-            if not self.cache_dir:
+            # ------------------------------------------------------------
+            # SKU properties used by text formatting
+            # ------------------------------------------------------------
+            with open(
+                self.cache_dir / "sku_properties_dict.pkl",
+                "wb",
+            ) as f:
+                pickle.dump(self.sku_properties_dict, f)
+
+            # ------------------------------------------------------------
+            # Graph-derived centralities
+            # ------------------------------------------------------------
+            with open(
+                self.cache_dir / "sku_centrality.pkl",
+                "wb",
+            ) as f:
+                pickle.dump(getattr(self, "sku_centrality", {}), f)
+
+            with open(
+                self.cache_dir / "cat_centrality.pkl",
+                "wb",
+            ) as f:
+                pickle.dump(getattr(self, "cat_centrality", {}), f)
+
+            self.logger.info("Calculated Retailrocket data saved to cache.")
+
+        except Exception as exc:
+            self.logger.error(
+                f"Failed to save calculated Retailrocket data: {exc}",
+                exc_info=True,
+            )
+
+    def _load_calculated_data_from_cache(
+        self,
+        expected_reference_time: Optional[datetime] = None,
+    ) -> bool:
+        """
+        Load derived statistics for a full Retailrocket run.
+
+        This cache is intentionally only reused for runs without an
+        observation cutoff. Temporal-split runs must recompute their
+        statistics from the observation history to avoid leakage.
+        """
+        if not self.cache_dir:
+            return False
+
+        required_files = [
+            self.cache_dir / "retailrocket_cache_metadata.json",
+            self.cache_dir / "global_stats.json",
+            self.cache_dir / "user_segments.json",
+            self.cache_dir / "product_popularity.parquet",
+            self.cache_dir / "category_popularity.parquet",
+            self.cache_dir / "sku_properties_dict.pkl",
+            self.cache_dir / "sku_centrality.pkl",
+            self.cache_dir / "cat_centrality.pkl",
+        ]
+
+        missing_files = [
+            path.name for path in required_files if not path.exists()
+        ]
+
+        if missing_files:
+            self.logger.info(
+                "Derived Retailrocket cache incomplete; recomputing. "
+                f"Missing: {', '.join(missing_files)}"
+            )
+            return False
+
+        try:
+            # ------------------------------------------------------------
+            # Validate metadata
+            # ------------------------------------------------------------
+            with open(
+                self.cache_dir / "retailrocket_cache_metadata.json",
+                "r",
+                encoding="utf-8",
+            ) as f:
+                metadata = json.load(f)
+
+            if metadata.get("cache_version") != "retailrocket_full_v1":
+                self.logger.info(
+                    "Retailrocket cache version does not match; recomputing."
+                )
                 return False
-            all_loaded = True
-            try:
-                try:
-                    with open(self.cache_dir / 'global_stats.json','r') as f:
-                        self.global_stats = json.load(f)
-                except Exception:
-                    self.logger.warning("Cache miss: global_stats.json")
-                    self.global_stats = {}
-                    all_loaded = False
-                    
-                try:
-                    with open(self.cache_dir / 'user_segments.json','r') as f:
-                        self.user_segments = json.load(f)
-                except Exception:
-                    self.logger.warning("Cache miss: user_segments.json")
-                    self.user_segments = {}
-                    all_loaded = False
-                    
-                try:
-                    self.product_popularity = pl.read_parquet(
-                        self.cache_dir / 'product_popularity.parquet'
+
+            if expected_reference_time is not None:
+                expected_iso = expected_reference_time.isoformat()
+                cached_reference_time = metadata.get("reference_time")
+
+                if cached_reference_time != expected_iso:
+                    self.logger.info(
+                        "Retailrocket cache reference time does not match "
+                        "the current full run; recomputing."
                     )
-                except Exception:
-                    self.logger.warning("Cache miss: product_popularity.parquet")
-                    self.product_popularity = None
-                    all_loaded = False
-                    
-                try:
-                    self.category_popularity = pl.read_parquet(
-                        self.cache_dir / 'category_popularity.parquet'
-                    )
-                except Exception:
-                    self.logger.warning("Cache miss: category_popularity.parquet")
-                    self.category_popularity = None
-                    
-                try:
-                    filtered_pkl = self.cache_dir / 'sku_properties_dict_filtered.pkl'
-                    full_pkl = self.cache_dir / 'sku_properties_dict.pkl'
-                    
-                    if filtered_pkl.exists():
-                        with open(filtered_pkl, 'rb') as f:
-                            self.sku_properties_dict = pickle.load(f)
-                        self.logger.info(f"Loaded FILTERED {len(self.sku_properties_dict)} SKU properties")
-                    else:
-                        with open(full_pkl, 'rb') as f:
-                            self.sku_properties_dict = pickle.load(f)
-                        self.logger.info(f"Loaded FULL {len(self.sku_properties_dict)} SKU properties")
-                except Exception:
-                    self.logger.warning("Cache miss: sku_properties_dict.pkl")
-                    self.sku_properties_dict = {}
-                    all_loaded = False
-                    
-                # ✅ FIX : J'ai SUPPRIMÉ le bloc problématique qui utilisait relevant_client_ids
-                # Le filtrage des SKU doit se faire dans load_data(), pas ici !
-                        
-                if all_loaded:
-                    self.logger.info("Loaded calculated data from cache.")
-            except Exception as e:
-                self.logger.error(f"Error loading cache: {e}")
-                all_loaded = False
-            return all_loaded
+                    return False
+
+            # ------------------------------------------------------------
+            # Restore global statistics and segments
+            # ------------------------------------------------------------
+            with open(
+                self.cache_dir / "global_stats.json",
+                "r",
+                encoding="utf-8",
+            ) as f:
+                self.global_stats = json.load(f)
+
+            # rfm_recencies must be NumPy again for the existing metric code.
+            if isinstance(self.global_stats.get("rfm_recencies"), list):
+                self.global_stats["rfm_recencies"] = np.array(
+                    self.global_stats["rfm_recencies"],
+                    dtype=int,
+                )
+
+            with open(
+                self.cache_dir / "user_segments.json",
+                "r",
+                encoding="utf-8",
+            ) as f:
+                self.user_segments = json.load(f)
+
+            # ------------------------------------------------------------
+            # Restore popularity tables
+            # ------------------------------------------------------------
+            self.product_popularity = pl.read_parquet(
+                self.cache_dir / "product_popularity.parquet"
+            )
+
+            self.category_popularity = pl.read_parquet(
+                self.cache_dir / "category_popularity.parquet"
+            )
+
+            # ------------------------------------------------------------
+            # Restore SKU properties and graph centralities
+            # ------------------------------------------------------------
+            with open(
+                self.cache_dir / "sku_properties_dict.pkl",
+                "rb",
+            ) as f:
+                self.sku_properties_dict = pickle.load(f)
+
+            with open(
+                self.cache_dir / "sku_centrality.pkl",
+                "rb",
+            ) as f:
+                self.sku_centrality = pickle.load(f)
+
+            with open(
+                self.cache_dir / "cat_centrality.pkl",
+                "rb",
+            ) as f:
+                self.cat_centrality = pickle.load(f)
+
+            # Keep both names available because existing helper methods use
+            # both attribute spellings.
+            self.category_centrality = self.cat_centrality
+
+            # ------------------------------------------------------------
+            # Rebuild in-memory popularity lookup used by RAW_SEQUENCE POP_Q
+            # ------------------------------------------------------------
+            global POP_QUANT_EDGES
+
+            if (
+                self.product_popularity is not None
+                and "popularity_score" in self.product_popularity.columns
+            ):
+                scores = (
+                    self.product_popularity["popularity_score"]
+                    .drop_nulls()
+                    .to_numpy()
+                )
+
+                if scores.size > 0:
+                    POP_QUANT_EDGES = [
+                        float(np.quantile(scores, quantile))
+                        for quantile in (0.25, 0.50, 0.75)
+                    ]
+
+                self.pop_score_by_sku = {
+                    int(row["sku"]): float(row["popularity_score"])
+                    for row in self.product_popularity
+                    .select(["sku", "popularity_score"])
+                    .iter_rows(named=True)
+                    if row["sku"] is not None
+                    and row["popularity_score"] is not None
+                }
+
+            self.logger.info(
+                "Loaded derived Retailrocket statistics and centralities "
+                "from cache."
+            )
+            return True
+
+        except Exception as exc:
+            self.logger.warning(
+                f"Unable to restore Retailrocket derived cache: {exc}. "
+                "Recomputing statistics."
+            )
+            return False
 
     # ------------------------------------------------------------------ #
     # _compute_global_statistics (lazy-accelerated)                     #
