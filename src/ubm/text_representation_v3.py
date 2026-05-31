@@ -4115,7 +4115,11 @@ class TextRepresentationGenerator:
 
         # 3) Strip out RAW_SEQUENCE for the LLM
         def _strip_raw(txt: str) -> str:
-            return re.split(r'(?i)RAW_SEQUENCE:', txt, maxsplit=1)[0].rstrip()
+            return re.split(
+                r"\n## RAW_SEQUENCE ##\n",
+                txt,
+                maxsplit=1,
+            )[0].rstrip()
         
         stripped_texts: Dict[int, str] = {}
         for cid, rt in base_texts.items():
@@ -4139,19 +4143,29 @@ class TextRepresentationGenerator:
             raw_seq  = rep.get("profile", {}).get("raw_sequence", "")
 
             # get the bullet list string from our LLM
-            portrait_str   = portraits.get(cid, "")
-            portrait_block = "\n## PORTRAIT ##\n" + portrait_str
+            portrait_str = portraits.get(cid, "")
 
-            raw_block = ("\n## RAW_SEQUENCE ##\n" + raw_seq) if raw_seq else ""
-            if summary.strip().endswith("```"):
-                summary += "\n```"
-            final_rich = "\n".join([
-                summary,
+            summary_without_raw = _strip_raw(summary)
+
+            raw_preview = ""
+            if raw_seq:
+                raw_preview = "\n".join(raw_seq.split("</s>")[-50:]) + "\n…"
+
+            final_parts = [
+                summary_without_raw,
                 "## PORTRAIT ##",
                 portrait_str.strip(),
-                "## RAW_SEQUENCE ##",
-                "\n".join(raw_seq.split("</s>")[-50:]) + "\n…",
-            ])
+            ]
+
+            if raw_preview:
+                final_parts.extend([
+                    "## RAW_SEQUENCE ##",
+                    raw_preview,
+                ])
+
+            final_parts.append("[END]")
+
+            final_rich = "\n".join(final_parts)
 
             enriched_texts[cid] = final_rich
 
