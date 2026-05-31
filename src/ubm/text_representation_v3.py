@@ -1,59 +1,42 @@
-# ubm/text_representation_v3.py
-
 from __future__ import annotations
-# import unsloth
-import os, multiprocessing
-# 1) On détecte automatiquement  le nombre de vCPU (sur a2-highgpu-1g → 12)
+
+import gc
+import json
+import logging
+import math
+import multiprocessing
+import os
+import pickle
+import random
+import re
+from collections import Counter, defaultdict
+from datetime import datetime, timedelta
+from itertools import combinations
+from math import log2
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+
+import networkit as nk
+import numpy as np
+import polars as pl
+from scipy.stats import entropy
+
+
+# ---------------------------------------------------------------------------
+# Runtime configuration
+# ---------------------------------------------------------------------------
 n_threads = multiprocessing.cpu_count()
 print(f"n_threads:{n_threads}")
-# For BLAS / OpenMP back-ends
-os.environ["OPENBLAS_NUM_THREADS"]  = "4"
-os.environ["MKL_NUM_THREADS"]       = "4"
-os.environ["NUMEXPR_MAX_THREADS"]   = "4"
-os.environ["OMP_NUM_THREADS"]       = "4"
-os.environ["POLARS_MAX_THREADS"]    = "4"
-#import unsloth
-# NetworKit – needs an explicit call
-import networkit as nk
+
+os.environ["OPENBLAS_NUM_THREADS"] = "4"
+os.environ["MKL_NUM_THREADS"] = "4"
+os.environ["NUMEXPR_MAX_THREADS"] = "4"
+os.environ["OMP_NUM_THREADS"] = "4"
+os.environ["POLARS_MAX_THREADS"] = "4"
+
 nk.setNumberOfThreads(4)
-import pyarrow.parquet as pq  
-import math             #  ← NEW
-import statistics        #  ← NEW
-import torch
-import torch.nn.functional as F
-import numpy as np
-import pandas as pd
-import re
-import time
-import scipy.sparse as sp
-import pickle
-import json
-from datetime import datetime, timedelta
-from typing import Dict, List, Tuple, Set, Optional, Union, Any
-import logging
-from scipy.stats import entropy
-from collections import Counter, defaultdict
-import os
-from tqdm import tqdm
-from pathlib import Path
-import gc
-import random
-from datetime import datetime, timedelta
-from typing import Dict, List, Any, Optional, Union
-import polars as pl
-import json, pickle, gc, os, logging, networkx as nx
-from collections import Counter, defaultdict
-from pathlib import Path
-from tqdm import tqdm
-from itertools import combinations          # <-- IMPORT supplémentaire en haut de fichier
-from sklearn.cluster import MiniBatchKMeans
-from collections import Counter
-from math import log2
-import networkit as nk
-# from networkit import embedding as nk_embed      # NetworKit’s fast Node2Vec
-#from .portrait_generator import PortraitGenerator, generate_portraits
+
 print("Polars pool size:", pl.threadpool_size())
-from math import isfinite
 pl.enable_string_cache()
 # --- Setup Logging ---
 logger = logging.getLogger(__name__)
@@ -115,30 +98,10 @@ class FeatureExtractorBase:
         """Extract features for a client - must be implemented by subclasses"""
         raise NotImplementedError("Subclasses must implement extract_features")
 
-
-def compute_sparse_pagerank(src: np.ndarray,
-                            dst: np.ndarray,
-                            weights: np.ndarray,
-                            alpha: float = 0.85,
-                            tol: float = 1e-6,
-                            max_iter: int = 1000) -> dict[int, float]:
-    """
-    Parallel PageRank using NetworKit.  ~10-20× faster than NetworkX
-    on million-edge graphs.
-    """
-    g, id2orig = _nk_graph_from_edges(src, dst, weights, directed=True)
-    pr = nk.centrality.PageRank(
-        g, damp=alpha, tol=tol, maxIterations=max_iter, normalized=False
-    )
-    pr.run()
-    scores = pr.scores()          # list[float] aligned with 0…n-1 ids
-    return {int(id2orig[i]): s for i, s in enumerate(scores)}
-
 # ------------------------------------------------------------------
 # NetworKit helpers
 # ------------------------------------------------------------------
 # --- BEGIN PATCH: helpers -----------------------------------------------------
-import numpy as np
 
 def _nk_graph_from_edges(src: np.ndarray,
                          dst: np.ndarray,
@@ -178,54 +141,6 @@ def compute_sparse_pagerank(src: np.ndarray,
     scores = pr.scores()                       # list[float] aligned with 0…n-1 ids
     return {int(id2orig[i]): s for i, s in enumerate(scores)}
 
-
-
-def _shannon_entropy(counter: Counter) -> float:
-    """Shannon entropy in bits from a Counter of counts."""
-    n = sum(counter.values())
-    if n == 0:
-        return 0.0
-    return -sum((c / n) * log2(c / n) for c in counter.values())
-
-def _approx_token_len(text: str) -> int:
-    """Very cheap proxy for token count (≈ whitespace split)."""
-    return len(text.split())
-
-
-def _truncate_to_max_tokens(lines: List[str], limit: int) -> List[str]:
-    """Greedy keep‑from‑start strategy (safer for ordered / weighted chunks)."""
-    kept: List[str] = []
-    for ln in lines:
-        if _approx_token_len("\n".join(kept + [ln])) > limit:
-            break
-        kept.append(ln)
-    return kept
-
-
-def _top_k_features(features: List[str], k: int) -> Tuple[List[str], List[str]]:
-    """Return `(top_k, overflow)` lists – *overflow* can be shuffled/dropped."""
-    if len(features) <= k:
-        return features, []
-    return features[:k], features[k:]
-
-
-def _repeat_for_weight(lines: List[str], repeat: int) -> List[str]:
-    """Naïve implicit weight: duplicate *every* line *repeat* times."""
-    if repeat <= 1:
-        return lines
-    out: List[str] = []
-    for ln in lines:
-        out.extend([ln] * repeat)
-    return out
-def bucketize_days(delta_days: int) -> str:
-    if delta_days <= 3:
-        return "R_0-3d"
-    if delta_days <= 7:
-        return "R_3-7d"
-    if delta_days <= 30:
-        return "R_7-30d"
-    return "R_30+d"
-
 POP_QUANT_EDGES: list = []   # global mutable (sera rempli une fois)
 
 def pop_bin(score: float) -> str:
@@ -244,7 +159,6 @@ def pop_bin(score: float) -> str:
 def _build_rich_text(
     section_map: dict[str, list[str]],
     max_tokens: int = 3500,
-    implicit_repeat: int = 1,
     top_per_section: int = 10,
     shuffle_seed: int | None = None,
     use_markers: bool = True,
@@ -1096,16 +1010,6 @@ class IntentFeatureExtractor(FeatureExtractorBase):
             else:
                 features.append("Funnel Stage: Inactive")
 
-            # Last action type already handled by TemporalExtractor recency
-            # last_event = events.sort("timestamp", descending=True).row(0, named=True)
-            # if last_event:
-            #     last_type = last_event['event_type']; last_time = last_event['timestamp']
-            #     days_since_last = (now - last_time).days if last_time else -1
-            #     recency_tag = f"(last {days_since_last+1}d)" if days_since_last < 30 and days_since_last >=0 else "(>30d ago)" if days_since_last >=0 else ""
-            #     # Mapping simple
-            #     action_map = {'product_buy':'Purchase', 'add_to_cart':'Cart Add', 'search_query':'Search', 'page_visit':'Visit', 'remove_from_cart':'Cart Remove'}
-            #     features.append(f"Last action type: {action_map.get(last_type, last_type)} {recency_tag}")
-
         except Exception as e: self.logger.debug(f"Err funnel pos: {e}"); features.append("Err funnel position.")
 
     def _extract_cart_abandon_signal(self, events: pl.DataFrame, features: List[str]) -> None:
@@ -1878,8 +1782,6 @@ class AdvancedUBMGenerator:
         self.global_stats: Dict[str, Any] = {}
         self.user_segments: Dict[str, List[int]] = {}
         self._extractors: Dict[str, Any] = {}
-        # Retailrocket has no predefined Synerise propensity target lists.
-        # We will derive popular SKUs and categories from training data later.  
         self.dataset_end: Optional[datetime] = None
         self.reference_time: Optional[datetime] = None
 
@@ -1933,9 +1835,9 @@ class AdvancedUBMGenerator:
 
             # Retailrocket raw schema:
             # timestamp, visitorid, event, itemid, transactionid
-            #
-            # Internal schema retained for the existing feature extractors:
-            # client_id, timestamp, sku, event_type, transaction_id, url, query
+    
+            # Internal Retailrocket profile schema:
+            # client_id, timestamp, sku, event_type, transaction_id
             lf_all = (
                 pl.scan_csv(events_path)
                 .select([
@@ -1961,14 +1863,9 @@ class AdvancedUBMGenerator:
                       .otherwise(pl.col("event"))
                       .cast(pl.Categorical)
                       .alias("event_type"),
-
                     pl.col("transactionid")
                       .cast(pl.Int64, strict=False)
                       .alias("transaction_id"),
-
-                    # Retailrocket does not provide URL or search-query events.
-                    pl.lit(None).cast(pl.Utf8).alias("url"),
-                    pl.lit(None).cast(pl.Utf8).alias("query"),
                 ])
             )
 
@@ -2214,144 +2111,7 @@ class AdvancedUBMGenerator:
               .sort("timestamp")
               .collect(engine='streaming')
         )
-    # ─────────────────────────────────────────────────────────────
-    #  AdvancedUBMGenerator._build_url_graph_embeddings  (NEW)
-    # ─────────────────────────────────────────────────────────────
-    def _build_url_graph_embeddings(self) -> None:
-        """
-        Full-streaming URL⇆SKU bipartite graph:
-          1. écrit (src_hash, dst_hash) dans un CSV par blocs de 1 M lignes
-          2. lit le CSV chunk par chunk pour créer le graphe NetworKit
-          3. Node2Vec 32 d puis k-means (20 clusters)
-        Pic RAM ≈ 3-4 Go quel que soit le dataset.
-        """
-        # ---------------------------------------------------------
     
-        if self.lazy_all is None:
-            return
-        if os.getenv("SKIP_URL_GRAPH", "0") == "1":
-            self.logger.info("SKIP_URL_GRAPH=1 → URL-SKU graph bypassed.")
-            self.url_embed, self.url_centroid, self.url_cluster_map = {}, None, {}
-            return
-    
-        self.logger.info("Building URL–SKU bipartite graph (streaming)…")
-    
-        # ── 1) TOP-N URLs (petit collect) ─────────────────────────
-        TOP_URLS = 500
-        top_urls = (
-            self.lazy_all
-              .filter(pl.col("url").is_not_null())
-              .group_by("url")
-              .agg(pl.count().alias("cnt"))
-              .sort("cnt", descending=True)
-              .limit(TOP_URLS)             # .head() == .limit()
-              .collect()                   # ← on retire le streaming=True
-              ["url"]
-              .to_list()
-        )
-        top_urls = set(top_urls)
-    
-        # ── 2) génère (sid, url_hash) et (sid, sku_hash) ──────────
-        with_sid = (
-            self.lazy_all
-              .filter(pl.col("url").is_not_null() | pl.col("sku").is_not_null())
-              .with_columns(
-                  (
-                      (
-                          (pl.col("timestamp")
-                             .diff()
-                             .over("client_id")
-                             .dt.total_seconds() / 60)
-                          .fill_null(1e9)  > 30
-                      ) | (pl.col("client_id").diff().is_not_null())
-                  ).alias("new_sess")
-              )
-              .with_columns(
-                  pl.col("new_sess").cum_sum().over("client_id").alias("sid")
-              )
-        )
-    
-        MASK63 = (1 << 63) - 1            # 0x7FFF…FFFF
-        
-        urls = (
-            with_sid
-              .filter(pl.col("url").is_in(top_urls))
-              .select([
-                  "sid",
-                  (
-                      (pl.col("url")
-                         .hash(seed=0)        # UInt64
-                         % MASK63             # <= 2^63-1  
-                      )
-                      .cast(pl.Int64)         # signé OK
-                  ).alias("url_hash")
-              ])
-              .unique()
-        )
-    
-        skus = (
-            with_sid
-              .filter(pl.col("sku").is_not_null())
-              .select([
-                  "sid",
-                  (pl.col("sku") * -1).cast(pl.Int64).alias("sku_hash")
-              ])
-              .unique()
-        )
-    
-        # ── 3) jointure croisée → edges.csv (streaming v2 OK) ────
-        edges_lf = (
-            urls.join(skus, on="sid")
-                .select([
-                    pl.col("url_hash").alias("src_hash"),
-                    pl.col("sku_hash").alias("dst_hash")
-                ])
-        )
-        
-        import networkit as nk
-        g, label2nid = nk.Graph(0, weighted=True, directed=False), {}
-        def _nid(lbl: int) -> int:
-            return label2nid.setdefault(lbl, g.addNode())
-        
-        BATCH = 1_000_000   # lignes
-        stream = edges_lf.iter_batches(batch_size=BATCH, streaming=True)
-        for tbl in stream:                         # PyArrow Table
-            src = tbl.column(0).to_numpy(zero_copy_only=False)
-            dst = tbl.column(1).to_numpy(zero_copy_only=False)
-            g.addEdges(np.vectorize(_nid)(src), np.vectorize(_nid)(dst))
-        
-        self.logger.info("Graph nodes=%d edges=%d", g.numberOfNodes(), g.numberOfEdges())
-    
-        # ── 5) Node2Vec 32 d  ─────────────────────────────────────
-        n2v = nk_embed.Node2Vec(g, 1.0, 1.0, 10, 10, 32)
-        n2v.run()
-        emb = n2v.getFeatures()
-    
-        # ── 6) embeddings & centroid ──────────────────────────────
-        self.url_embed = {
-            lbl: emb[nid] for lbl, nid in label2nid.items() if lbl >= 0
-        }
-        if not self.url_embed:
-            self.logger.warning("No URL embeddings – aborting.")
-            self.url_centroid, self.url_cluster_map = None, {}
-            return
-        self.url_centroid = np.stack(list(self.url_embed.values())).mean(axis=0)
-    
-        # ── 7) k-means (20) pour clusteriser les URLs ─────────────
-        try:
-            u, vec = zip(*self.url_embed.items())
-            km = MiniBatchKMeans(n_clusters=20, batch_size=4096, random_state=42)
-            labels = km.fit_predict(np.stack(vec))
-            self.url_cluster_map = {ui: int(lb) for ui, lb in zip(u, labels)}
-            self.logger.info("URL clusters: %d", len(set(labels)))
-        except Exception as e:
-            self.logger.error("URL clustering failed: %s", e)
-            self.url_cluster_map = {}
-    
-        self.logger.info("Node2Vec done: %d URL vectors", len(self.url_embed))
-    # ─────────────────────────────────────────────────────────────
-
-    # ──────────────────────────────────────────────────────────────
     # ------------------------------------------------------------------ #
     # Cat->Cat centralité globale (PageRank sur transitions)           #
     # ------------------------------------------------------------------ #
@@ -3065,84 +2825,6 @@ class AdvancedUBMGenerator:
         
         self.category_popularity = df
         self.logger.info(f"Computed category popularity for {df.height} categories.")
-    # ------------------------------------------------------------------ #
-    # ------------------------------------------------------------------ #
-    # === Lazy-aware Helpers for Global Computations ==================== #
-    # ------------------------------------------------------------------ #
-
-    def _build_category_centrality(self) -> None:
-        """
-        Builds a directed graph Cat_i→Cat_j from successive page_visit or product_buy events,
-        computes PageRank, all via lazy Polars to avoid full materialization.
-        """
-        if self.lazy_all is None:
-            self.cat_centrality = {}
-            return
-        # collect only category transitions
-        df = (
-            self.lazy_all
-              .filter(pl.col('category_id').is_not_null())
-              .select(['client_id','timestamp','category_id'])
-              .sort(['client_id','timestamp'])
-              .with_columns(
-                  pl.col('category_id').shift(-1).over('client_id').alias('next_cat')
-              )
-              .filter(pl.col('next_cat').is_not_null())
-              .select(['category_id','next_cat'])
-        ).collect(engine='streaming')
-
-        # build graph
-        G = nx.DiGraph()
-        for row in df.iter_rows(named=True):
-            src, dst = int(row['category_id']), int(row['next_cat'])
-            if src == dst:
-                continue
-            if G.has_edge(src, dst):
-                G[src][dst]['weight'] += 1
-            else:
-                G.add_edge(src, dst, weight=1)
-        if G.number_of_nodes() == 0:
-            self.cat_centrality = {}
-            self.logger.info("Category centrality skipped (empty graph).")
-            return
-        # PageRank
-        pr = nx.pagerank(G, weight='weight', max_iter=100, tol=1e-4)
-        self.cat_centrality = pr
-        self.logger.info(
-            f"Built centrality maps  • SKU:{len(getattr(self,'sku_centrality',{}))}  • CAT:{len(pr)}"
-        )
-
-    def _compute_global_co_occurrences(self, session_gap: int = 30) -> None:
-        """
-        Counts co-occurring SKU and category pairs within user sessions (lazy + collect small slice).
-        """
-        if self.lazy_all is None:
-            return
-        # collect relevant events
-        df = (
-            self.lazy_all
-              .filter(pl.col('event_type').is_in(['product_buy','add_to_cart','page_visit']))
-              .select(['client_id','timestamp','sku','category_id'])
-              .sort(['client_id','timestamp'])
-        ).collect(engine='streaming')
-        # identify sessions
-        diff = df['timestamp'].diff().dt.total_seconds() / 60
-        df = df.with_columns(((diff.is_null()) | (diff > session_gap)).cum_sum().alias('sess_id'))
-        sku_pairs = Counter()
-        cat_pairs = Counter()
-        from itertools import combinations
-        for (_cid, sess), sub in df.group_by(['client_id','sess_id']):
-            skus = sub['sku'].drop_nulls().unique().to_list()
-            cats = sub['category_id'].drop_nulls().unique().to_list()
-            for i,j in combinations(sorted(set(skus)),2):
-                sku_pairs[(int(i),int(j))] += 1
-            for c1,c2 in combinations(sorted(set(cats)),2):
-                cat_pairs[(int(c1),int(c2))] += 1
-        self.global_stats['global_sku_pairs'] = dict(sku_pairs)
-        self.global_stats['global_cat_pairs'] = dict(cat_pairs)
-        self.logger.info(
-            f"Global co-occurrences  SKU_pairs:{len(sku_pairs)}  CAT_pairs:{len(cat_pairs)}"
-        )
 
     # ------------------------------------------------------------------
     # Segmentation principale : acheteurs / navigateurs actifs, etc.
@@ -3175,7 +2857,7 @@ class AdvancedUBMGenerator:
               .fill_null(0)
         )
         # ensure all event-type cols exist
-        for c in ['page_visit','product_buy','add_to_cart','search_query']:
+        for c in ["page_visit", "product_buy", "add_to_cart"]:
             if c not in df_counts.columns:
                 df_counts = df_counts.with_columns(pl.lit(0).alias(c))
     
@@ -3392,9 +3074,8 @@ class AdvancedUBMGenerator:
             if "category_id" in available_columns or "sku" in available_columns:
                 self._extractors["graph"] = GraphFeatureExtractor(self)
 
-            # We retain the intent extractor because it also creates funnel and
-            # cart-behavior features. For Retailrocket, search-specific output
-            # correctly reports that no search events exist.
+            # Retailrocket supports view/cart/purchase funnel and cart-behavior
+            # features, but provides no search-query events.
             if "event_type" in available_columns:
                 self._extractors["intent"] = IntentFeatureExtractor(self)
 
@@ -3453,29 +3134,49 @@ class AdvancedUBMGenerator:
 
     # --- Multi-Resolution History Helpers ---
     def _format_event_for_history(self, event_row: Dict[str, Any]) -> str:
-        event_type = event_row.get("event_type"); sku = event_row.get("sku"); url = event_row.get("url")
-        query = event_row.get("query"); ts = event_row.get("timestamp")
-        ts_str = ts.strftime('%Y%m%d-%H%M') if isinstance(ts, datetime) else "NT" # Format plus court
-        text_parts = [f"[{ts_str}] E:{event_type or '?'}"]
+        """Format one Retailrocket interaction for the recent-history section."""
+        event_type = event_row.get("event_type")
+        sku = event_row.get("sku")
+        timestamp = event_row.get("timestamp")
+
+        timestamp_text = (
+            timestamp.strftime("%Y%m%d-%H%M")
+            if isinstance(timestamp, datetime)
+            else "NT"
+        )
+
+        text_parts = [f"[{timestamp_text}] E:{event_type or '?'}"]
+
+        if sku is None:
+            return "".join(text_parts)
+
         try:
-            if sku is not None:
-                sku_int = int(sku); text_parts.append(f" S:{sku_int}")
-                props = self.sku_properties_dict.get(sku_int, {})
-                if props.get("category") is not None:
-                    text_parts.append(f" C:{props['category']}")
+            sku_int = int(sku)
+            text_parts.append(f" S:{sku_int}")
 
-                is_available = event_row.get("is_available")
-                if is_available is not None:
-                    text_parts.append(
-                        f" A:{'IN' if int(is_available) == 1 else 'OUT'}"
-                    )
+            category_id = event_row.get("category_id")
+            if category_id is None:
+                category_id = self.sku_properties_dict.get(
+                    sku_int, {}
+                ).get("category")
 
-                if props.get("price") is not None:
-                    text_parts.append(f" P:{props['price']}")
-            elif url is not None: text_parts.append(f" U:{url}")
-            elif query is not None: text_parts.append(f" Q:{hash(str(query))%10000:04d}") # Hash court pour Q
-        except Exception: pass # Ignorer erreurs de formatage individuelles
+            if category_id is not None:
+                text_parts.append(f" C:{int(category_id)}")
+
+            is_available = event_row.get("is_available")
+            if is_available is not None:
+                text_parts.append(
+                    f" A:{'IN' if int(is_available) == 1 else 'OUT'}"
+                )
+
+        except (TypeError, ValueError):
+            self.logger.debug(
+                "Unable to format Retailrocket history event: %s",
+                event_row,
+            )
+
         return "".join(text_parts)
+
 
     def _generate_detailed_events_text(self, client_events: pl.DataFrame, limit=30) -> str:
         if client_events.height == 0: return "No recent activity."
@@ -3597,131 +3298,75 @@ class AdvancedUBMGenerator:
 
         return SEP_TOKEN.join(seq_tokens)    
     
+
+    def _shannon_entropy(self, counter: Counter) -> float:
+        """Return Shannon entropy in bits for observed categorical values."""
+        total = sum(counter.values())
+
+        if total == 0:
+            return 0.0
+
+        return -sum(
+            (count / total) * log2(count / total)
+            for count in counter.values()
+            if count > 0
+        )
     def _compute_compact_metrics(self, events: pl.DataFrame) -> list[str]:
         """
-        Renvoie des tags compacts (≤10 tokens chacun) :
-          NAME_STD, Δ$, BURST, CAT_PR_TOP, H_cat, H_price
-        S'adapte aux schémas avec event_type / price_bucket / emb_str.
+        Return compact Retailrocket-compatible behavioral metrics.
+
+        Retailrocket supports behavioral timestamps and categories, but the
+        current pipeline does not expose validated prices or product-name
+        embeddings.
         """
-        tags = []
-        
-        # ---------- helpers internes -------------------------------------------
-        evt_col   = "event_type" if "event_type" in events.columns else "event"
-        price_col = "price" if "price" in events.columns else "price_bucket"
-        
-        def _bucket_to_num(s: pl.Series) -> np.ndarray:
-            """Convertit price_bucket en valeurs numériques, en gérant les nulls"""
-            if s.dtype == pl.Int64 or s.dtype == pl.Float64:
-                return s.to_numpy()
-            
-            # Filtrer les nulls avant d'appliquer str.replace
-            if s.null_count() > 0:
-                # Option 1: Remplacer les nulls par une valeur par défaut
-                s = s.fill_null("0")
-            
-            # Maintenant on peut appliquer str.replace en toute sécurité
-            return s.str.replace(r"[^0-9]", "").cast(pl.Int32, strict=False).fill_null(0).to_numpy()
-        
-        # ---------- NAME_STD ----------------------------------------------------
-        emb = None
-        if "name_embedding" in events.columns:
-            emb = np.vstack([vec for vec in events["name_embedding"].to_list() if vec is not None])
-        elif "emb_str" in events.columns:
-            str_vecs = [
-                v for v in events["emb_str"].to_list()
-                if v is not None and isinstance(v, (str, bytes)) and v.strip()
-            ]
-            if str_vecs:
-                parsed_vecs = []
-                for v in str_vecs:
-                    try:
-                        clean_v = v.strip()
-                        if clean_v.startswith('[') and clean_v.endswith(']'):
-                            clean_v = clean_v[1:-1]
-                        vec = np.fromstring(clean_v, dtype=np.float32, sep=" ")
-                        if vec.size > 0 and np.all(np.isfinite(vec)):
-                            parsed_vecs.append(vec)
-                    except Exception:
-                        continue
-                
-                if parsed_vecs:
-                    try:
-                        emb = np.vstack(parsed_vecs)
-                    except Exception:
-                        emb = None
-        
-        if emb is not None and emb.size > 0:
+        tags: list[str] = []
+
+        # Activity concentration across hours.
+        if events.height > 0 and "timestamp" in events.columns:
             try:
-                if emb.dtype.kind in ['f', 'i', 'u']:
-                    name_std = round(float(np.std(emb)), 2)
-                    tags.append(f"NAME_STD:{name_std}")
-            except Exception:
-                pass
-        
-        # ---------- Δ Panier / Prix ---------------------------------------------
-        if price_col in events.columns:
-            buy_mask   = pl.col(evt_col) == "product_buy"
-            cart_mask  = pl.col(evt_col) == "add_to_cart"
-            
-            # Filtrer les événements avec prix non-null
-            buy_events = events.filter(buy_mask & pl.col(price_col).is_not_null())
-            cart_events = events.filter(cart_mask & pl.col(price_col).is_not_null())
-            
-            if buy_events.height > 0 and cart_events.height > 0:
-                buy_vals = _bucket_to_num(buy_events[price_col])
-                cart_vals = _bucket_to_num(cart_events[price_col])
-                
-                if buy_vals.size and cart_vals.size and cart_vals.mean() > 0:
-                    delta_pct = 100 * (buy_vals.mean() - cart_vals.mean()) / cart_vals.mean()
-                    tags.append(f"Δ$:{delta_pct:+.0f}%")
-        
-        # ---------- BURST score --------------------------------------------------
-        if events.height and "timestamp" in events.columns:
-            try:
-                hour_counts = np.bincount(events["timestamp"].dt.hour().fill_null(0).to_numpy(), minlength=24)
-                mu, var = hour_counts.mean(), hour_counts.var()
-                if mu > 0:
-                    tags.append(f"BURST:{round(var/mu,2)}")
-            except Exception:
-                pass
-        
-        # ---------- Graph centralité catégorie ----------------------------------
+                hour_counts = np.bincount(
+                    events["timestamp"]
+                    .dt.hour()
+                    .fill_null(0)
+                    .to_numpy(),
+                    minlength=24,
+                )
+                mean_count = hour_counts.mean()
+                variance = hour_counts.var()
+
+                if mean_count > 0:
+                    tags.append(f"BURST:{round(variance / mean_count, 2)}")
+
+            except Exception as exc:
+                self.logger.debug(f"Unable to compute BURST metric: {exc}")
+
+        # Centrality of the user's most central interacted category.
         if hasattr(self, "category_centrality") and "category_id" in events.columns:
-            cats = [c for c in events["category_id"].drop_nulls().to_list()
-                    if c in self.category_centrality]
-            if cats:
-                top_cat = max(cats, key=lambda c: self.category_centrality[c])
-                score = round(self.category_centrality[top_cat], 2)
-                tags.append(f"CAT_PR_TOP:{top_cat}({score})")
-        
-        # ---------- Entropies ----------------------------------------------------
-        from collections import Counter
-        
-        # Helper pour calculer l'entropie Shannon
-        def _shannon_entropy(counter: Counter) -> float:
-            n = sum(counter.values())
-            if n == 0:
-                return 0.0
-            from math import log2
-            return -sum((c / n) * log2(c / n) for c in counter.values() if c > 0)
-        
-        # Entropie des catégories
+            categories = [
+                category_id
+                for category_id in events["category_id"].drop_nulls().to_list()
+                if category_id in self.category_centrality
+            ]
+
+            if categories:
+                top_category = max(
+                    categories,
+                    key=lambda category_id: self.category_centrality[category_id],
+                )
+                score = round(self.category_centrality[top_category], 2)
+                tags.append(f"CAT_PR_TOP:{top_category}({score})")
+
+        # Entropy of category interactions.
         if "category_id" in events.columns:
-            cat_list = events["category_id"].drop_nulls().to_list()
-            if cat_list:
-                cat_entropy = _shannon_entropy(Counter(cat_list))
-                tags.append(f"H_cat:{round(cat_entropy,1)}")
-        
-        # Entropie des prix
-        if price_col in events.columns:
-            price_events = events.filter(pl.col(price_col).is_not_null())
-            if price_events.height > 0:
-                price_vals = _bucket_to_num(price_events[price_col])
-                price_vals = price_vals[price_vals > 0]  # Filtrer les 0
-                if price_vals.size > 0:
-                    price_entropy = _shannon_entropy(Counter(price_vals))
-                    tags.append(f"H_price:{round(price_entropy,1)}")
-        
+            category_values = events["category_id"].drop_nulls().to_list()
+
+            if category_values:
+                category_entropy = self._shannon_entropy(
+                    Counter(category_values)
+                )
+                
+                tags.append(f"H_cat:{round(category_entropy, 1)}")
+
         return tags
         
     def _compute_extra_short_metrics(
