@@ -23,61 +23,57 @@ logging.basicConfig(
 MODEL_NAME = "unsloth/gemma-3-1b-it-unsloth-bnb-4bit"
 #MODEL_NAME = "google/gemma-3-1b-it"
 CTX_LIMIT = 3048
-MAX_PROMPT_TOKENS = 400  # Réduit de 512 pour éviter OOM
+MAX_PROMPT_TOKENS = int(os.getenv("PORTRAIT_MAX_PROMPT_TOKENS", "1000"))  # Réduit de 512 pour éviter OOM
 GEN_TOKENS = 128
 BATCH_SIZE = int(os.getenv("PORTRAIT_BATCH", "180")) 
 HF_TOKEN = os.getenv("HF_TOKEN")
 if not HF_TOKEN:
     raise ValueError("La variable d'environnement HF_TOKEN n'est pas définie.")
 
-# [COMPETITION_BRIEF reste identique]
-COMPETITION_BRIEF = textwrap.dedent("""
-[CONTEXT – ACM RecSys Challenge 2025]
+RETAILROCKET_BRIEF = textwrap.dedent("""
+[CONTEXT – RETAILROCKET E-COMMERCE BEHAVIOUR DATASET]
 
-You receive a **structured e-commerce user profile** (> 1 M SKUs).
-Produce a professional and exhaustive **behavioural portrait** as a list of plain-text bullet points for stakeholders.
+You receive a structured behavioural profile derived from observed
+Retailrocket interactions.
 
-Open tasks:
- • **churn** – binary; churn if ≥ 1 purchase **and** ≥ 14 days inactivity  
- • **propensity_category** – multilabel; top-100 categories  
- • **propensity_sku**      – multilabel; top-100 SKUs  
+Observed event types:
+- page_visit
+- add_to_cart
+- product_buy
 
-Hidden tasks:
-Exposé general signals: temporal habits, funnel stage, price sensitivity, popularity,
-exploration vs purchase, etc.
+Available profile signals may include:
+- user segment and recency/churn indicators
+- temporal browsing and purchase habits
+- view/cart/purchase funnel behaviour
+- product availability interactions
+- personal SKU and category propensities
+- overlap with globally popular Retailrocket SKUs and categories
+- category/product exploration and graph-centrality signals
 
-Overall metric = 0.8 × AUROC + 0.1 × Novelty + 0.1 × Diversity.
-Key User Behavior Insights:
+Important interpretation rules:
+- The current Retailrocket pipeline does not provide validated price data.
+- The current Retailrocket pipeline does not provide search-query behaviour.
+- Do not infer price sensitivity, discount responsiveness, search intent,
+  demographics, brand preferences, or causal explanations.
+- Do not invent SKU or category identifiers.
+- Preserve relevant SKU_... and CAT_... identifiers exactly as provided.
+- SKU_PROPENSITY and CAT_PROPENSITY describe personal user affinity.
+- GLOBAL_TOP_* signals describe overlap with globally popular products or
+  categories derived from the available observation history.
 
-Segmentation: 96% of users are non-buyers; only 4% purchase.
-Purchase Path: 57% of purchases occur without a preceding add_to_cart event. The most common journey involves multiple page visits before a purchase.
-User Loyalty: 77% of buyers are single-category loyal.
-Timing: Average time from add_to_cart to buy is 32 minutes; from search to buy is over 2 hours.
-Signal Strength: add_to_cart is a significantly stronger purchase predictor (0.53 correlation) than search (0.34).
+Produce a concise behavioural portrait suitable for a text-based user
+representation in recommender-system modelling.
 
-### OUTPUT FORMAT (≤ 10 bullets, each on its own line)
-- Each line must start with "- " (dash + space)
-- No code, no functions, no code fences
-- Plain English only
-
-### EXAMPLES
-**Good:**
-- Category_XXX enthusiast with declining engagement.
-- Key segment: SKU_XXX
-- Evening shopper
-- High price sensitivity
-- Recommendation: Send 10% discount on top SKUs
-
-**Bad:**
-```python
-def summarize_user_profile(...):
-    ...
-```
-
-REMINDER:
-You are an expert behavioural analyst.
-Do NOT generate ANY code, functions, or code fences.
-Be concise and human-readable.
+### OUTPUT FORMAT
+- Output 4 to 8 bullet points.
+- Each line must start with "- ".
+- Plain English only.
+- Describe observed behavioural signals, not marketing actions.
+- Mention recency or churn risk when present.
+- Mention funnel behaviour when present.
+- Mention important SKU/category affinities or global-popularity overlap when present.
+- Do not output code, markdown headings, code fences, or explanations.
+- Terminate with "— FIN —".
 
 — FIN —
 """)
@@ -121,20 +117,48 @@ class PortraitGenerator:
             "Terminate with '— FIN —'\n"
         )
 
-    def _strip_rich_text(self, rt: str, keep_raw: bool = False, last_n: int = 30) -> str:
-        """Nettoie le texte pour le portrait"""
-        import re
-        
-        rt = re.sub(r'##\s*PORTRAIT\s*##.*?(?=##|$|\[END\])', '', rt, flags=re.DOTALL)
+    def _strip_rich_text(
+    self,
+    rt: str,
+    keep_raw: bool = False,
+    last_n: int = 30,
+) -> str:
+        """
+        Prepare a compact Retailrocket profile for portrait generation.
+    
+        Raw event sequences and recent-history event listings are removed because
+        the portrait should be based on the compact behavioural summaries,
+        propensities, and popularity signals.
+        """
+        rt = re.sub(
+            r"##\s*PORTRAIT\s*##.*?(?=##|$|\[END\])",
+            "",
+            rt,
+            flags=re.DOTALL,
+        )
+    
         if not keep_raw:
-            rt = re.sub(r'##\s*RAW_SEQUENCE\s*##.*?(?=##|$|\[END\])', '', rt, flags=re.DOTALL)
-        rt = rt.replace('[END]', '').strip()
-        
-        
-        # Limite ajoutée pour éviter OOM
-        if len(rt) > 6000:  # ~1500 tokens max
-            rt = rt[:6000] + "\n[TRUNCATED FOR MEMORY]"
-        
+            rt = re.sub(
+                r"##\s*RAW_SEQUENCE\s*##.*?(?=##|$|\[END\])",
+                "",
+                rt,
+                flags=re.DOTALL,
+            )
+    
+        rt = re.sub(
+            r"\[RECENT_HISTORY\]\s*"
+            r"##\s*RECENT_HISTORY_14D\s*##.*?"
+            r"(?=\n\[[A-Z_]+\]\n|\n\[END\]|\Z)",
+            "",
+            rt,
+            flags=re.DOTALL,
+        )
+    
+        rt = rt.replace("[END]", "").strip()
+    
+        if len(rt) > 8000:
+            rt = rt[:8000] + "\n[TRUNCATED FOR MEMORY]"
+    
         return rt
 
     def _encode_batch(self, items):
@@ -150,7 +174,7 @@ class PortraitGenerator:
                 {
                     "role": "system",
                     "content": (
-                        self.system_header.strip() + "\n\n" + COMPETITION_BRIEF.strip()
+                        self.system_header.strip() + "\n\n" + RETAILROCKET_BRIEF.strip()
                     ),
                 },
                 {
