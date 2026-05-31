@@ -56,7 +56,6 @@ SECTIONS_ORDER: List[str] = [
     "RECENT_HISTORY_14D",
     "TEMPORAL",
     "SEQUENCE",
-    "PRICE",
     "AVAILABILITY",
     "SOCIAL",
     "GLOBAL_POPULARITY",
@@ -72,7 +71,6 @@ SECTION_MARKERS = {
     "RECENT_HISTORY_14D": "[RECENT_HISTORY]",
     "TEMPORAL": "[TIME]",
     "SEQUENCE": "[SEQ]",
-    "PRICE": "[PRICE]",
     "AVAILABILITY": "[AVAIL]",
     "SOCIAL": "[SOCIAL]",
     "GLOBAL_POPULARITY": "[TOP]",
@@ -609,7 +607,7 @@ class SequenceFeatureExtractor(FeatureExtractorBase):
             if views == 0 and cart_adds == 0 and purchases == 0:
                 return
 
-            funnel_stages = ["Observed funnel events:"]
+            funnel_stages = ["All-profile-history funnel events:"]
 
             if views > 0:
                 funnel_stages.append(f"  Product Views: {views}")
@@ -1037,93 +1035,6 @@ class IntentFeatureExtractor(FeatureExtractorBase):
             num_sessions = session_starts.sum()
             return int(num_sessions)
         except Exception as e: self.logger.error(f"Err counting sessions: {e}"); return 1
-
-
-class PriceFeatureExtractor(FeatureExtractorBase):
-    """Extract price sensitivity and purchase behavior features"""
-    # --- Code inchangé ---
-    # (Ajouter 'now' comme argument non utilisé)
-    def extract_features(self, client_id: int, events: pl.DataFrame, now: datetime) -> List[str]:
-        if 'price_bucket' not in events.columns: return ["Price features skipped."]
-        features = []
-        try:
-            events_with_price = events.filter(pl.col('price_bucket').is_not_null())
-            if events_with_price.height == 0: return ["No price data."]
-            self._extract_price_range(events_with_price, features)
-            self._extract_price_sensitivity(client_id, events_with_price, features)
-            has_discount_cols = any(c in events.columns for c in ['discount', 'discount_percentage', 'original_price'])
-            if has_discount_cols: self._extract_discount_patterns(events_with_price, features)
-            # else: features.append("Discount patterns skipped.") # Optionnel
-        except Exception as e: self.logger.error(f"Err price client {client_id}: {e}"); features.append("Err price")
-        # --- RFM quick tag ---
-        purchases = events_with_price.filter(pl.col('event_type') == 'product_buy')
-        if purchases.height:
-            rec = (now - purchases['timestamp'].max()).days               # Recency
-            freq = purchases.filter(pl.col('timestamp') >= now - timedelta(days=90)).height
-            mon = purchases['price_bucket'].mean()                        # Monetary (moyenne des buckets)
-            features.append(f"RFM:{rec}:{freq}:{mon:.0f}")
-               
-        return features
-
-    def _extract_price_range(self, events: pl.DataFrame, features: List[str]) -> None:
-        try:
-            relevant_events = events.filter( pl.col('event_type').is_in(['page_visit', 'add_to_cart', 'product_buy']) )
-            if relevant_events.height == 0: return
-            price_stats = relevant_events.select(pl.col('price_bucket')).describe() # Utiliser 'price_bucket'
-            stats_dict = {row[0]: row[1] for row in price_stats.iter_rows()}
-            min_price = stats_dict.get('min'); max_price = stats_dict.get('max')
-            avg_price = stats_dict.get('mean'); std_price = stats_dict.get('std')
-            count = stats_dict.get('count')
-            if count is not None and count >= 2:
-                if min_price is not None and max_price is not None:
-                     features.append(f"Interacted price range (bucket): {min_price:.0f} - {max_price:.0f} (avg {avg_price:.0f})")
-                     price_range = max_price - min_price
-                     if price_range > 30: features.append("Wide price exploration.")
-                     elif price_range < 10: features.append("Narrow price focus.")
-                purchase_prices = relevant_events.filter(pl.col('event_type') == pl.lit('product_buy', dtype=pl.Categorical))['price_bucket']
-                if purchase_prices.len() >= 2:
-                    avg_purchase = purchase_prices.mean(); std_purchase = purchase_prices.std()
-                    if avg_purchase is not None and avg_purchase > 0 and std_purchase is not None:
-                         cv = std_purchase / avg_purchase
-                         if cv < 0.15: features.append("Consistent purchase price.")
-                         elif cv > 0.4: features.append("Varied purchase prices.")
-        except Exception as e: self.logger.debug(f"Err price range: {e}"); features.append("Err price range.")
-
-    def _extract_price_sensitivity(self, client_id: int, events: pl.DataFrame, features: List[str]) -> None:
-        try:
-            price_col = 'price_bucket'
-            cart_events = events.filter(pl.col('event_type') == pl.lit('add_to_cart', dtype=pl.Categorical))
-            purchase_events = events.filter(pl.col('event_type') == pl.lit('product_buy', dtype=pl.Categorical))
-            if cart_events.height > 0 and purchase_events.height > 0:
-                avg_cart_price = cart_events[price_col].mean()
-                avg_purchase_price = purchase_events[price_col].mean()
-                if avg_cart_price is not None and avg_purchase_price is not None and avg_cart_price > 0:
-                    ratio = avg_purchase_price / avg_cart_price
-                    if ratio < 0.8: features.append("Sensitivity: High (buys cheaper than adds)")
-                    elif ratio > 1.2: features.append("Sensitivity: Low (buys similar/pricier)")
-                    else: features.append("Sensitivity: Moderate")
-
-            # Abandon vs price logic
-            if cart_events.height > 0 and 'sku' in events.columns:
-                cart_skus_prices = cart_events.select(['sku', price_col]).drop_nulls()
-                if cart_skus_prices.height > 0:
-                     purchased_skus = purchase_events.select('sku').drop_nulls()['sku'].unique().to_list()
-                     if purchased_skus:
-                          abandoned_items = cart_skus_prices.filter(~pl.col('sku').is_in(purchased_skus))
-                          purchased_carted_items = cart_skus_prices.filter(pl.col('sku').is_in(purchased_skus))
-                          if abandoned_items.height > 0 and purchased_carted_items.height > 0:
-                               avg_abandoned_price = abandoned_items[price_col].mean()
-                               avg_purchased_price = purchased_carted_items[price_col].mean()
-                               if avg_abandoned_price is not None and avg_purchased_price is not None:
-                                    if avg_abandoned_price > avg_purchased_price * 1.2:
-                                         features.append("Tends to abandon higher-priced cart items.")
-        except Exception as e: self.logger.error(f"Err price sensitivity client {client_id}: {e}"); features.append("Err price sensitivity.")
-
-    def _extract_discount_patterns(self, events: pl.DataFrame, features: List[str]) -> None:
-        # Placeholder - logic depends on actual discount columns
-        relevant_discount_cols = [c for c in ['discount', 'discount_percentage', 'original_price'] if c in events.columns]
-        if relevant_discount_cols:
-             features.append(f"Discount info present ({', '.join(relevant_discount_cols)}), analysis TBD.")
 
 class AvailabilityFeatureExtractor(FeatureExtractorBase):
     """Extract stock-availability interaction patterns from Retailrocket."""
@@ -2923,125 +2834,103 @@ class AdvancedUBMGenerator:
     
         self.user_segments = segs
     
-        # 7) Further sub-segmentation
+        # Additional Retailrocket-compatible category segmentation.
         try:
-            schema = self.lazy_all.collect_schema()
-
-            # Retailrocket currently has no validated price_bucket column.
-            if "price_bucket" in schema:
-                self._segment_users_by_price_sensitivity(df)
-
-            if "category_id" in schema:
-                self._segment_users_by_category_behavior(df)
-
-        except Exception as e:
-            self.logger.error(f"Err additional segmentation: {e}")
+            self._segment_users_by_category_behavior(df)
+        except Exception as exc:
+            self.logger.error(f"Err category segmentation: {exc}")
     
         self.logger.info(
             f"User segmentation done: Buyers={len(segs['buyers'])}, "
             f"Active relative buyers={len(segs['active_buyers_relative'])}"
         )
 
-    def _segment_users_by_price_sensitivity(self, user_counts: pl.DataFrame) -> None:
+    def _segment_users_by_category_behavior(
+        self,
+        df: pl.DataFrame,
+    ) -> None:
         """
-        Splits users into price sensitivity segments based on avg add_to_cart vs purchase price buckets,
-        computed lazily to avoid full event tables in memory.
+        Add Retailrocket-compatible category-behavior segments.
+
+        Users are classified according to the concentration of their observed
+        category interactions:
+        - category_loyal: activity strongly concentrated on one category
+        - category_explorer: activity spread across several categories
+        - moderate_explorer: intermediate behavior
         """
         if self.lazy_all is None:
             return
-        try:
-            # compute avg price for cart and buy per user
-            price_lf = (
-                self.lazy_all
-                  .filter(pl.col('price_bucket').is_not_null() & pl.col('event_type').is_in(['add_to_cart','product_buy']))
-                  .group_by(['client_id','event_type'])
-                  .agg(pl.mean('price_bucket').alias('avg_price'))
-            ).collect(engine='streaming')
-            price_lf = price_lf.pivot(index='client_id', columns='event_type', values='avg_price', aggregate_function='first')
-            df_price = user_counts.select('client_id').join(price_lf, on='client_id', how='left').fill_null(0)
-            if 'add_to_cart' not in df_price.columns or 'product_buy' not in df_price.columns:
-                return
 
-            df_price = df_price.with_columns(
-                (pl.when(pl.col('add_to_cart')>0)
-                   .then(pl.col('product_buy')/pl.col('add_to_cart'))
-                   .otherwise(None)
-                 ).alias('sensitivity_ratio')
+        category_counts = (
+            self.lazy_all
+            .filter(pl.col("category_id").is_not_null())
+            .group_by(["client_id", "category_id"])
+            .agg(pl.len().alias("category_events"))
+            .collect(engine="streaming")
+        )
+
+        if category_counts.is_empty():
+            self.user_segments["category_loyal"] = []
+            self.user_segments["moderate_explorer"] = []
+            self.user_segments["category_explorer"] = []
+            return
+
+        category_summary = (
+            category_counts
+            .group_by("client_id")
+            .agg([
+                pl.col("category_events").sum().alias("total_category_events"),
+                pl.col("category_events").max().alias("top_category_events"),
+                pl.len().alias("unique_categories"),
+            ])
+            .with_columns(
+                (
+                    pl.col("top_category_events")
+                    / pl.col("total_category_events")
+                ).alias("top_category_share")
             )
-            valid = df_price.filter(pl.col('sensitivity_ratio').is_not_null() & pl.col('sensitivity_ratio').is_finite())['sensitivity_ratio']
-            if valid.len() > 10:
-                low, high = valid.quantile(0.33), valid.quantile(0.66)
-                self.user_segments['price_sensitive'] = df_price.filter(pl.col('sensitivity_ratio') < low)['client_id'].to_list()
-                self.user_segments['price_moderate'] = df_price.filter((pl.col('sensitivity_ratio') >= low) & (pl.col('sensitivity_ratio') <= high))['client_id'].to_list()
-                self.user_segments['price_insensitive'] = df_price.filter(pl.col('sensitivity_ratio') > high)['client_id'].to_list()
-                self.logger.info(
-                    f"Price segmentation: Sens={len(self.user_segments['price_sensitive'])}, "
-                    f"Mod={len(self.user_segments['price_moderate'])}, "
-                    f"Insens={len(self.user_segments['price_insensitive'])}"
+        )
+
+        category_loyal = (
+            category_summary
+            .filter(pl.col("top_category_share") >= 0.75)
+            ["client_id"]
+            .to_list()
+        )
+
+        category_explorer = (
+            category_summary
+            .filter(
+                (pl.col("top_category_share") < 0.40)
+                & (pl.col("unique_categories") >= 3)
+            )
+            ["client_id"]
+            .to_list()
+        )
+
+        moderate_explorer = (
+            category_summary
+            .filter(
+                (pl.col("top_category_share") < 0.75)
+                & ~(
+                    (pl.col("top_category_share") < 0.40)
+                    & (pl.col("unique_categories") >= 3)
                 )
-        except Exception as e:
-            self.logger.error(f"Err price segmentation: {e}")
-
-    def _segment_users_by_category_behavior(self, user_counts: pl.DataFrame) -> None:
-        """
-        Classifies users into category loyalty/exploration segments based on distribution of page_visit counts,
-        all computed on a small collected slice.
-        """
-        if self.lazy_all is None:
-            return
-        try:
-            # 1) Count page visits by category per user
-            cat_lf = (
-                self.lazy_all
-                  .filter((pl.col('event_type')=='page_visit') & pl.col('category_id').is_not_null())
-                  .group_by(['client_id','category_id'])
-                  .agg(pl.count().alias('view_count'))
             )
-            df_cat = cat_lf.collect(engine='streaming')
-            if df_cat.height == 0:
-                return
+            ["client_id"]
+            .to_list()
+        )
 
-            # 2) Aggregate per user: total views, max in one category, num categories
-            user_cat = (
-                df_cat
-                  .group_by('client_id')
-                  .agg(
-                      pl.sum('view_count').alias('total_views'),
-                      pl.max('view_count').alias('max_views_in_one_cat'),
-                      pl.count().alias('n_cats')
-                  )
-                  .with_columns(
-                      (pl.col('max_views_in_one_cat')/pl.col('total_views')).alias('category_loyalty_score')
-                  )
-            )
+        self.user_segments["category_loyal"] = category_loyal
+        self.user_segments["moderate_explorer"] = moderate_explorer
+        self.user_segments["category_explorer"] = category_explorer
 
-            # 3) Join with full user list
-            df_stats = user_counts.select('client_id').join(user_cat, on='client_id', how='left').fill_null(0)
-
-            # Thresholds
-            loyal_thresh = 0.75
-            explorer_thresh = 0.40
-
-            # 4) Assign segments
-            self.user_segments['category_loyal'] = (
-                df_stats.filter(pl.col('category_loyalty_score') >= loyal_thresh)['client_id'].to_list()
-            )
-            self.user_segments['category_explorer'] = (
-                df_stats.filter((pl.col('category_loyalty_score') <= explorer_thresh) & (pl.col('n_cats') >= 3))['client_id'].to_list()
-            )
-            self.user_segments['moderate_explorer'] = (
-                df_stats.filter((pl.col('category_loyalty_score') > explorer_thresh) & (pl.col('category_loyalty_score') < loyal_thresh))['client_id'].to_list()
-            )
-
-            self.logger.info(
-                f"Category segmentation: Loyal={len(self.user_segments['category_loyal'])}, "
-                f"Moderate={len(self.user_segments['moderate_explorer'])}, "
-                f"Explorer={len(self.user_segments['category_explorer'])}"
-            )
-        except Exception as e:
-            self.logger.error(f"Err category segmentation: {e}")
-
-
+        self.logger.info(
+            "Category segmentation: Loyal=%d, Moderate=%d, Explorer=%d",
+            len(category_loyal),
+            len(moderate_explorer),
+            len(category_explorer),
+        )
     # --- Getters ---
     def get_feature_extractors(self) -> Dict[str, FeatureExtractorBase]:
             """
@@ -3078,9 +2967,6 @@ class AdvancedUBMGenerator:
             # features, but provides no search-query events.
             if "event_type" in available_columns:
                 self._extractors["intent"] = IntentFeatureExtractor(self)
-
-            if "price_bucket" in available_columns:
-                self._extractors["price"] = PriceFeatureExtractor(self)
 
             if "is_available" in available_columns:
                 self._extractors["availability"] = AvailabilityFeatureExtractor(self)
@@ -3184,17 +3070,58 @@ class AdvancedUBMGenerator:
         event_texts = [self._format_event_for_history(row) for row in recent_events_rows]
         return "\n".join(filter(None, event_texts))
 
-    def _generate_summarized_events_text(self, client_events: pl.DataFrame, limit=10) -> str:
-        if client_events.height == 0: return "No medium-term activity."
-        summary = [f"Event count: {client_events.height}"]
-        event_counts = client_events.group_by('event_type').agg(pl.count().alias('count')).sort('count', descending=True)
-        summary.append("Event Types: " + ", ".join([f"{row['event_type']}:{row['count']}" for row in event_counts.iter_rows(named=True)]))
-        if 'category_id' in client_events.columns:
-            purchases = client_events.filter((pl.col('event_type') == pl.lit('product_buy', dtype=pl.Categorical)) & pl.col('category_id').is_not_null())
+    def _generate_summarized_events_text(
+        self,
+        client_events: pl.DataFrame,
+        limit: int = 10,
+    ) -> str:
+        """Summarize interactions from the medium-term sequence window."""
+        if client_events.height == 0:
+            return "No medium-term activity."
+
+        summary = [
+            f"Sequence-window event count: {client_events.height}"
+        ]
+
+        event_counts = (
+            client_events
+            .group_by("event_type")
+            .agg(pl.len().alias("count"))
+            .sort("count", descending=True)
+        )
+
+        summary.append(
+            "Sequence-window event types: "
+            + ", ".join(
+                f"{row['event_type']}:{row['count']}"
+                for row in event_counts.iter_rows(named=True)
+            )
+        )
+
+        if "category_id" in client_events.columns:
+            purchases = client_events.filter(
+                (pl.col("event_type") == pl.lit("product_buy", dtype=pl.Categorical))
+                & pl.col("category_id").is_not_null()
+            )
+
             if purchases.height > 0:
-                category_counts = purchases.group_by('category_id').agg(pl.count().alias('count')).sort('count', descending=True)
+                category_counts = (
+                    purchases
+                    .group_by("category_id")
+                    .agg(pl.len().alias("count"))
+                    .sort("count", descending=True)
+                )
+
                 top_cats = category_counts.head(limit).to_dicts()
-                summary.append("Top Purchased Cats: " + ", ".join([f"[CAT_{c['category_id']}]:{c['count']}" for c in top_cats]))
+
+                summary.append(
+                    "Sequence-window top purchased categories: "
+                    + ", ".join(
+                        f"[CAT_{row['category_id']}]:{row['count']}"
+                        for row in top_cats
+                    )
+                )
+
         return "\n".join(summary)
 
     def _generate_aggregated_events_text(self, client_events: pl.DataFrame) -> str:
@@ -3673,7 +3600,6 @@ class AdvancedUBMGenerator:
                 "sequence": "SEQUENCE",
                 "social": "SOCIAL",
                 "retailrocket_global_popularity": "GLOBAL_POPULARITY",
-                "price": "PRICE",
                 "availability": "AVAILABILITY",
                 "intent": "OVERVIEW",
                 "graph": "CUSTOM",
@@ -3701,7 +3627,7 @@ class AdvancedUBMGenerator:
                             "PURCHASE_PATTERN:",
                             "AVG_PURCHASE_INTERVAL:",
                             "POST_PURCHASE",
-                            "LTV_INDICATOR:",
+                        
                         )):
                             target_sec = "CHURN_PROPENSITY"
 
@@ -3967,18 +3893,6 @@ class ChurnPropensityFeatureExtractor(FeatureExtractorBase):
                     features.append("POST_PURCHASE:CART_ACTIVITY")
             else:
                 features.append("POST_PURCHASE:NO_ACTIVITY")
-            
-            # Lifetime value indicators - FIXED: Keep as DataFrame or use .len() for Series
-            if 'price_bucket' in purchases.columns:
-                # Option 1: Keep as DataFrame
-                price_df = purchases.filter(pl.col('price_bucket').is_not_null()).select('price_bucket')
-                if price_df.height > 0:
-                    total_purchase_value = price_df['price_bucket'].sum()
-                    features.append(f"LTV_INDICATOR:{total_purchase_value}")
-                else:
-                    features.append("LTV_INDICATOR:0")
-            else:
-                features.append("LTV_INDICATOR:NO_PRICE_DATA")
             
         except Exception as e:
             self.logger.error(f"Error in churn signals for client {client_id}: {e}", exc_info=True)
