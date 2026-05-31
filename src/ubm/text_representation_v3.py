@@ -65,7 +65,6 @@ if not logger.hasHandlers():
 # ---------------------------------------------------------------------------
 MAX_RICH_TOKENS          : int = 4096  # set to 2048 if you want shorter texts
 TOP_FEATURES_PER_SECTION : int = 10    # soft‑cap per section before trimming
-IMPLICIT_WEIGHT_REPEAT   : int = 2     # repeat high‑weight tokens N times
 TOP_RETAILROCKET_SKUS: int = 100
 TOP_RETAILROCKET_CATEGORIES: int = 100
 SECTIONS_ORDER: List[str] = [
@@ -245,94 +244,92 @@ def pop_bin(score: float) -> str:
 def _build_rich_text(
     section_map: dict[str, list[str]],
     max_tokens: int = 3500,
-    implicit_repeat: int = 2,
+    implicit_repeat: int = 1,
     top_per_section: int = 10,
     shuffle_seed: int | None = None,
-    use_markers: bool = True,  # NOUVEAU paramètre
+    use_markers: bool = True,
 ) -> str:
     """
-    Version optimisée avec markers et déduplication améliorée
-    """
-    import random
-    import itertools
-    from collections import OrderedDict
+    Build the final readable user-profile representation.
 
+    Features are deduplicated and rendered only once. The previous implicit
+    weighting through identical repeated text lines is intentionally disabled
+    for the Retailrocket profile format, because it inflated the profile
+    without adding interpretable information.
+    """
     rnd = random.Random(shuffle_seed)
-    
-    # Déduplication globale des features
-    seen_features = set()
-    deduped_sections = {}
-    
+
+    # ------------------------------------------------------------
+    # Deduplicate identical feature lines globally while preserving
+    # the original first-occurrence order.
+    # ------------------------------------------------------------
+    seen_features: set[str] = set()
+    deduped_sections: dict[str, list[str]] = {}
+
     for section, items in section_map.items():
-        deduped_items = []
+        deduped_items: list[str] = []
+
         for item in items:
-            # Normaliser pour la déduplication
             normalized = item.strip().lower()
+
             if normalized not in seen_features:
                 seen_features.add(normalized)
                 deduped_items.append(item)
+
         deduped_sections[section] = deduped_items
 
     def _truncate(tokens: list[str], limit: int) -> list[str]:
         total = 0
-        out = []
-        for tok in tokens:
-            total += len(tok.split())
+        output: list[str] = []
+
+        for token in tokens:
+            total += len(token.split())
+
             if total > limit:
                 break
-            out.append(tok)
-        return out
+
+            output.append(token)
+
+        return output
+
+    # Ranking-oriented sections should keep their deterministic order.
+    ordered_sections = {
+        "GLOBAL_POPULARITY",
+        "SKU_PROPENSITY",
+        "CAT_PROPENSITY",
+    }
 
     lines: list[str] = []
 
     for section in SECTIONS_ORDER:
         items = deduped_sections.get(section, [])
+
         if not items:
             continue
 
-        # 1. Limiter au top K
-        items = items[:top_per_section]
+        rendered_items = items[:top_per_section]
 
-        # 2. Répétition implicite pour les items importants
-        repeated = []
-        for item in items:
-            # Les features de churn/propensity sont toujours répétées
-            if "CHURN_" in item or "PROPENSITY" in item or "**" in item:
-                repeated.extend([item] * implicit_repeat)
-            else:
-                repeated.append(item)
+        # Preserve ranked features exactly as generated.
+        # Other narrative feature sections may still be shuffled after the
+        # first two items, as in the existing profile-generation design.
+        if len(rendered_items) > 3 and section not in ordered_sections:
+            first_items = rendered_items[:2]
+            remaining_items = rendered_items[2:]
+            rnd.shuffle(remaining_items)
+            rendered_items = first_items + remaining_items
 
-        ordered_sections = {
-            "GLOBAL_POPULARITY",
-            "SKU_PROPENSITY",
-            "CAT_PROPENSITY",
-        }
-
-        if len(repeated) > 3 and section not in ordered_sections:
-            first_items = repeated[:2]
-            rest_items = repeated[2:]
-            rnd.shuffle(rest_items)
-            repeated = first_items + rest_items
-
-        # 4. Ajouter le marqueur de section et le contenu
         if use_markers and section in SECTION_MARKERS:
-            lines.append(f"{SECTION_MARKERS[section]}")
-        lines.append(f"## {section} ##")
-        lines.extend(repeated)
+            lines.append(SECTION_MARKERS[section])
 
-    # 5. Coupe globale au nombre de tokens demandé
+        lines.append(f"## {section} ##")
+        lines.extend(rendered_items)
+
     lines = _truncate(lines, max_tokens)
 
-    # 6. Ajouter un marqueur de fin
     if use_markers:
         lines.append("[END]")
 
     return "\n".join(lines)
-
-
-
-
-
 
 class TemporalFeatureExtractor(FeatureExtractorBase):
     """Extract temporal patterns from user behavior, enhanced with recency and inactivity."""
@@ -4047,12 +4044,6 @@ class AdvancedUBMGenerator:
                     )
                     feats = [f"{ex_name}-error"]
 
-                repeat = (
-                    IMPLICIT_WEIGHT_REPEAT
-                    if ex_name in ("top_sku", "top_category")
-                    else 1
-                )
-
                 for ft in feats:
                     target_sec = default_sec
 
@@ -4083,8 +4074,7 @@ class AdvancedUBMGenerator:
                         )):
                             target_sec = "SKU_PROPENSITY"
 
-                    for _ in range(repeat):
-                        section_map[target_sec].append(ft)
+                    section_map[target_sec].append(ft)
 
                     features_json.append({
                         "type": ex_name,
@@ -4197,12 +4187,12 @@ class AdvancedUBMGenerator:
             # ==============================================================
             try:
                 rich_text = _build_rich_text(
-                    section_map=section_map,
-                    max_tokens=max_length,
-                    implicit_repeat=IMPLICIT_WEIGHT_REPEAT,
-                    top_per_section=TOP_FEATURES_PER_SECTION,
-                    shuffle_seed=cid,
-                )
+                section_map=section_map,
+                max_tokens=max_length,
+                top_per_section=TOP_FEATURES_PER_SECTION,
+                shuffle_seed=cid,
+)
+                
             except Exception as exc:
                 self.logger.error(f"_build_rich_text failed for {cid}: {exc}")
                 # fallback – very plain
