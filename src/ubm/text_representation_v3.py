@@ -3,7 +3,6 @@
 from __future__ import annotations
 # import unsloth
 import os, multiprocessing
-import os; os.environ["SKIP_URL_GRAPH"] = "1"
 # 1) On détecte automatiquement  le nombre de vCPU (sur a2-highgpu-1g → 12)
 n_threads = multiprocessing.cpu_count()
 print(f"n_threads:{n_threads}")
@@ -98,12 +97,6 @@ SECTION_MARKERS = {
     "CUSTOM": "[MISC]"
 }
 
-
-# ─── HOT-URL & HOT-SKU FILTER THRESHOLDS ────────────────────────────────────
-# only keep URLs seen at least this many times when building the bipartite graph
-# only keep SKUs with popularity score ≥ this when building the bipartite graph
-URL_FREQ_THRESHOLD = 21
-SKU_POP_THRESHOLD  = 45
 # ---------------------------------------------------------------------------
 #                          UTILITY HELPERS                                   #
 # ---------------------------------------------------------------------------
@@ -119,49 +112,6 @@ class FeatureExtractorBase:
     def extract_features(self, client_id: int, events: pl.DataFrame, now: datetime) -> List[str]:
         """Extract features for a client - must be implemented by subclasses"""
         raise NotImplementedError("Subclasses must implement extract_features")
-# -------------------------------------------------------------
-class TopCategoryFeatureExtractor(FeatureExtractorBase):
-    """Met en avant les 100 catégories demandées par la task propensity_category."""
-
-    def __init__(self, parent):
-        super().__init__(parent)
-        self.top_cats = parent.top_categories     # list[int]
-
-    def extract_features(self, client_id: int, events: pl.DataFrame, now: datetime) -> List[str]:
-        if not self.top_cats:
-            return ["Top-category list unavailable"]
-        cat_ev = events.filter(
-            pl.col('category_id').is_in(self.top_cats) &
-            pl.col('event_type').is_in(['product_buy', 'add_to_cart', 'page_visit'])
-        )
-        if cat_ev.is_empty():
-            return ["No top-category interactions"]
-
-        rec_w = (
-            (pl.lit(now) - cat_ev['timestamp']).dt.total_seconds() / 86400 + 1
-        ).pow(-0.5)
-        cat_ev = cat_ev.with_columns(rec_w.alias('rw'))
-
-        scores = (
-            cat_ev.group_by('category_id')
-                  .agg([
-                      pl.len().alias('cnt'),
-                      pl.sum('rw').alias('rScore'),
-                      pl.max('timestamp').alias('last_ts')
-                  ])
-                  .sort('rScore', descending=True)
-        )
-
-        feats = []
-        for i, row in enumerate(scores.head(5).iter_rows(named=True), 1):
-            delta = (now - row['last_ts']).days
-            feats.append(f"TOPCAT{i}:CAT_{row['category_id']} rs={row['rScore']:.2f} "
-                         f"cnt={row['cnt']} last={delta}d")
-
-        cov = scores.height / len(self.top_cats)
-        feats.append(f"Top-category coverage:{cov:.0%}")
-        return feats
-
 
 
 def compute_sparse_pagerank(src: np.ndarray,
@@ -710,48 +660,84 @@ class SequenceFeatureExtractor(FeatureExtractorBase):
             self.logger.debug(f"Error extracting event sequences: {e}")
             features.append("Error extracting event sequences")
 
-    def _extract_purchase_funnel(self, events: pl.DataFrame, features: List[str]) -> None:
-        try:
-            tmp = events.group_by('event_type').agg(pl.count().alias('count'))
-            event_counts = {row['event_type']: row['count'] for row in tmp.iter_rows(named=True)}
-            views = event_counts.get('page_visit', 0); searches = event_counts.get('search_query', 0)
-            cart_adds = event_counts.get('add_to_cart', 0); purchases = event_counts.get('product_buy', 0)
-            if views == 0 and searches == 0 and cart_adds == 0 and purchases == 0: return
+    def _extract_purchase_funnel(
+        self,
+        events: pl.DataFrame,
+        features: List[str],
+    ) -> None:
+        """
+        Summarize observed Retailrocket funnel events.
 
-            funnel_stages = ["Purchase funnel analysis:"]
-            total_starts = views + searches
-            if total_starts > 0: funnel_stages.append(f"  Starts (View/Search): {total_starts}")
+        Retailrocket contains product views, cart additions and transactions,
+        but no search-query events. Ratios are descriptive event ratios and
+        should not be interpreted as a fully observed conversion path.
+        """
+        try:
+            tmp = (
+                events.group_by("event_type")
+                .agg(pl.len().alias("count"))
+            )
+
+            event_counts = {
+                row["event_type"]: row["count"]
+                for row in tmp.iter_rows(named=True)
+            }
+
+            views = event_counts.get("page_visit", 0)
+            cart_adds = event_counts.get("add_to_cart", 0)
+            purchases = event_counts.get("product_buy", 0)
+
+            if views == 0 and cart_adds == 0 and purchases == 0:
+                return
+
+            funnel_stages = ["Observed funnel events:"]
+
+            if views > 0:
+                funnel_stages.append(f"  Product Views: {views}")
+
             if cart_adds > 0:
-                if total_starts > 0:
-                    cart_rate = (cart_adds / total_starts) * 100
+                if views > 0:
+                    cart_view_ratio = (cart_adds / views) * 100
                     funnel_stages.append(
-                        f"  Cart Adds: {cart_adds} ({cart_rate:.1f}% of starts)"
+                        f"  Cart Adds: {cart_adds} "
+                        f"({cart_view_ratio:.1f}% relative to views)"
                     )
                 else:
                     funnel_stages.append(
-                        f"  Cart Adds: {cart_adds} (no preceding view observed)"
+                        f"  Cart Adds: {cart_adds} "
+                        f"(no preceding view observed)"
                     )
 
-                if purchases > 0:
-                    purchase_rate_from_cart = (purchases / cart_adds) * 100
+            if purchases > 0:
+                if cart_adds > 0 and purchases <= cart_adds:
+                    purchase_cart_ratio = (purchases / cart_adds) * 100
                     funnel_stages.append(
                         f"  Purchases: {purchases} "
-                        f"({purchase_rate_from_cart:.1f}% of cart adds)"
+                        f"({purchase_cart_ratio:.1f}% relative to cart adds)"
+                    )
+                elif cart_adds > 0:
+                    funnel_stages.append(
+                        f"  Purchases: {purchases} "
+                        f"(includes purchases without observed cart add)"
+                    )
+                else:
+                    funnel_stages.append(
+                        f"  Purchases: {purchases} "
+                        f"(no preceding cart add observed)"
                     )
 
-                    if total_starts > 0:
-                        purchase_rate_from_start = (purchases / total_starts) * 100
-                        funnel_stages.append(
-                            f"  Overall Conversion: "
-                            f"{purchase_rate_from_start:.2f}% from start"
-                        )
-            elif purchases > 0:
-                funnel_stages.append(f"  Purchases: {purchases} (direct or uncaptured cart add)")
+                if views > 0:
+                    purchase_view_ratio = (purchases / views) * 100
+                    funnel_stages.append(
+                        f"  Purchase/View Event Ratio: "
+                        f"{purchase_view_ratio:.2f}%"
+                    )
 
             if len(funnel_stages) > 1:
                 features.append("\n".join(funnel_stages))
-        except Exception as e:
-            self.logger.debug(f"Error extracting purchase funnel: {e}")
+
+        except Exception as exc:
+            self.logger.debug(f"Error extracting purchase funnel: {exc}")
             features.append("Error extracting purchase funnel")
 
     def _extract_Browse_sequences(self, events: pl.DataFrame, features: List[str]) -> None:
@@ -931,7 +917,6 @@ class GraphFeatureExtractor(FeatureExtractorBase):
             )
             sess_id = gaps_min.gt(sess_gap).cum_sum()  # fast cumulative ids
             rel_evt = rel_evt.with_columns(pl.Series('sid', sess_id))
-            rel_evt = rel_evt.filter(pl.col('sku').is_in(self.parent.top_skus))
 
             # 2) count SKU co-occurrences inside each session
             from itertools import combinations
@@ -986,37 +971,32 @@ class GraphFeatureExtractor(FeatureExtractorBase):
 class IntentFeatureExtractor(FeatureExtractorBase):
     """Extract search intent and interest patterns, with simple cart abandon signal."""
 
-    def extract_features(self, client_id: int, events: pl.DataFrame, now: datetime) -> List[str]:
-        features = []
-        if events.height == 0: return ["No activity data for intent analysis"]
-        try:
-            self._extract_search_intent(events, features)
-            self._extract_Browse_intent(events, features)
-            self._extract_funnel_position(events, features, now) # Passer now
-            self._extract_cart_abandon_signal(events, features) # Nouvelle méthode simple
-        except Exception as e:
-            self.logger.error(f"Error extracting intent features for client {client_id}: {e}", exc_info=self.parent.debug_mode)
-            features.append("Error during intent feature extraction.")
-        return features
+    def extract_features(
+        self,
+        client_id: int,
+        events: pl.DataFrame,
+        now: datetime,
+    ) -> List[str]:
+        features: List[str] = []
 
-    def _extract_search_intent(self, events: pl.DataFrame, features: List[str]) -> None:
+        if events.height == 0:
+            return ["No activity data for intent analysis"]
+
         try:
-            search_events = events.filter(pl.col('event_type') == pl.lit('search_query', dtype=pl.Categorical))
-            if search_events.height == 0: features.append("No search events."); return
-            features.append(f"Total searches: {search_events.height}")
-            if 'query' in search_events.columns:
-                query_hashes = search_events.filter(pl.col('query').is_not_null()).select(pl.col('query').hash().alias('query_hash'))['query_hash']
-                if query_hashes.len() > 0:
-                    unique_hashes_count = query_hashes.n_unique()
-                    features.append(f"Unique search hashes: {unique_hashes_count}")
-                    if unique_hashes_count < query_hashes.len():
-                        top_hash_info = query_hashes.value_counts().sort(by="count", descending=True).head(1)
-                        if top_hash_info.height > 0:
-                            top_hash, top_count = top_hash_info.row(0)
-                            features.append(f"Top search hash: [QUERY_{top_hash}] ({top_count}x)")
-                else: features.append("No valid search queries found.")
-            else: features.append("Query column missing.")
-        except Exception as e: self.logger.debug(f"Err search intent: {e}"); features.append("Err search intent.")
+            # Retailrocket contains views, cart additions and transactions,
+            # but no search-query events.
+            self._extract_Browse_intent(events, features)
+            self._extract_funnel_position(events, features, now)
+            self._extract_cart_abandon_signal(events, features)
+
+        except Exception as exc:
+            self.logger.error(
+                f"Error extracting intent features for client {client_id}: {exc}",
+                exc_info=self.parent.debug_mode,
+            )
+            features.append("Error during intent feature extraction.")
+
+        return features
 
     def _extract_Browse_intent(self, events: pl.DataFrame, features: List[str]) -> None:
         # Initialize cat_counts and total_cat_visits to default values
@@ -1096,14 +1076,20 @@ class IntentFeatureExtractor(FeatureExtractorBase):
         try:
             tmp = events.group_by('event_type').agg(pl.col('event_type').count().alias('count'))  # Changer pl.count() en pl.col().count()
             event_counts = {row['event_type']: row['count'] for row in tmp.iter_rows(named=True)}
-            views = event_counts.get('page_visit', 0); searches = event_counts.get('search_query', 0)
-            cart_adds = event_counts.get('add_to_cart', 0); purchases = event_counts.get('product_buy', 0)
+            views = event_counts.get("page_visit", 0)
+            cart_adds = event_counts.get("add_to_cart", 0)
+            purchases = event_counts.get("product_buy", 0)
 
-            if purchases > 0: features.append("Funnel Stage: Conversion")
-            elif cart_adds > 0: features.append("Funnel Stage: Consideration")
-            elif searches > 0 or views > 5: features.append("Funnel Stage: Research")
-            elif views > 0: features.append("Funnel Stage: Awareness")
-            else: features.append("Funnel Stage: Inactive")
+            if purchases > 0:
+                features.append("Funnel Stage: Conversion")
+            elif cart_adds > 0:
+                features.append("Funnel Stage: Consideration")
+            elif views > 5:
+                features.append("Funnel Stage: Browsing")
+            elif views > 0:
+                features.append("Funnel Stage: Awareness")
+            else:
+                features.append("Funnel Stage: Inactive")
 
             # Last action type already handled by TemporalExtractor recency
             # last_event = events.sort("timestamp", descending=True).row(0, named=True)
@@ -1540,123 +1526,6 @@ class SocialFeatureExtractor(FeatureExtractorBase):
             self.logger.debug(f"Err popularity: {e}")
             features.append("Err popularity patterns.")
 
-class NameEmbeddingExtractor(FeatureExtractorBase):
-    """Extract features based on product name embeddings."""
-    def extract_features(self, client_id: int, events: pl.DataFrame, now: datetime) -> List[str]:
-        if not hasattr(self.parent, 'sku_properties_dict') or not self.parent.sku_properties_dict:
-            return ["Product properties unavailable."]
-        features = []
-        try:
-            product_events = events.filter(
-                pl.col('event_type').is_in(['page_visit', 'add_to_cart', 'product_buy']) 
-                & pl.col('sku').is_not_null()
-            )
-            if product_events.height == 0:
-                return []
-            
-            valid_name_embeddings = []
-            interacted_skus = product_events['sku'].unique().drop_nulls().to_list()
-            if not interacted_skus:
-                return []
-    
-            for sku in interacted_skus:
-                props = self.parent.sku_properties_dict.get(int(sku))
-                if props and isinstance(props.get('name'), str) and props['name'].startswith('[') and props['name'].endswith(']'):
-                    name_embedding_str = props['name']
-                    try:
-                        name_embedding = [int(x) for x in name_embedding_str.strip('[]').split()]
-                        if name_embedding:  # Check not empty
-                            valid_name_embeddings.append(name_embedding)
-                    except Exception:
-                        continue
-    
-            if not valid_name_embeddings:
-                return ["No valid name embeddings found."]
-            
-            first_len = len(valid_name_embeddings[0])
-            consistent_embeddings = [emb for emb in valid_name_embeddings if len(emb) == first_len]
-            if not consistent_embeddings:
-                return ["Name embeddings have inconsistent lengths."]
-            if first_len == 0:
-                return ["Name embeddings have zero length."]
-    
-            # FIX: Ensure we have a proper 2D array before operations
-            try:
-                emb_array = np.array(consistent_embeddings, dtype=np.float32)
-                if emb_array.ndim != 2 or emb_array.shape[0] == 0:
-                    return ["Invalid embedding array shape."]
-                
-                avg_vector = np.mean(emb_array, axis=0)
-                if first_len > 32:
-                    emb_array = emb_array[:, :32]
-                    avg_vector = avg_vector[:32]
-                    first_len = 32
-    
-                avg_vector_str = ", ".join([f"{x:.2f}" for x in avg_vector])
-                features.append(f"AVG_PRODUCT_NAME_EMBEDDING (Dim:{first_len}): [{avg_vector_str}] ({len(consistent_embeddings)} items)")
-    
-                # Variance calculation with shape check
-                if len(consistent_embeddings) > 1 and emb_array.shape[0] > 1:
-                    std_vector = np.std(emb_array, axis=0)
-                    avg_std = np.mean(std_vector)
-                    if avg_std < 30:
-                        features.append("Product Name Focus: High (Low Variance)")
-                    elif avg_std > 70:
-                        features.append("Product Name Focus: Low (High Variance)")
-            except Exception as e:
-                self.logger.debug(f"Error computing embeddings: {e}")
-                return ["Error processing embeddings."]
-    
-        except Exception as e:
-            self.logger.error(f"Err name embedding client {client_id}: {e}")
-            features.append("Err name embedding.")
-        return features
-
-class TopSKUFeatureExtractor(FeatureExtractorBase):
-    """Focus sur les 100 SKUs scorés par la compétition"""
-
-    def __init__(self, parent):
-        super().__init__(parent)
-        self.top_skus = parent.top_skus
-
-    def extract_features(self, client_id: int, events: pl.DataFrame, now: datetime) -> List[str]:
-        if not self.top_skus:
-            return ["Top-SKU list unavailable"]
-        sku_ev = events.filter(
-            pl.col('sku').is_in(self.top_skus) &
-            pl.col('event_type').is_in(['product_buy', 'add_to_cart', 'page_visit'])
-        )
-        if sku_ev.is_empty():
-            return ["No top-SKU interactions"]
-
-        # ------- score récence × fréquence ---------------------------------
-        rec_w = (
-            (pl.lit(now) - sku_ev['timestamp']).dt.total_seconds() / 86400 + 1
-        ).pow(-0.5)
-        sku_ev = sku_ev.with_columns(rec_w.alias('rw'))
-
-        scores = (
-            sku_ev.group_by('sku')
-                  .agg([
-                      pl.len().alias('cnt'),
-                      pl.sum('rw').alias('rScore'),
-                      pl.max('timestamp').alias('last_ts')
-                  ])
-                  .sort('rScore', descending=True)
-        )
-
-        feats = []
-        for i, row in enumerate(scores.head(5).iter_rows(named=True), 1):
-            delta = (now - row['last_ts']).days
-            feats.append(f"TOPSKU{i}:SKU_{row['sku']} rs={row['rScore']:.2f} "
-                         f"cnt={row['cnt']} last={delta}d")
-
-        # Couverture
-        cov = scores.height / len(self.top_skus)
-        feats.append(f"Top-SKU coverage:{cov:.0%}")
-
-        return feats
-
 # --- Main Generator Class ---
 # --- Constants for raw sequence generation ---
 SEP_TOKEN = "</s>"
@@ -1834,8 +1703,6 @@ class AdvancedUBMGenerator:
 
 
         self.logger = logging.getLogger(self.__class__.__name__)
-        self.url_freq_threshold = URL_FREQ_THRESHOLD
-        self.sku_pop_threshold  = SKU_POP_THRESHOLD
         if self.debug_mode:
             self.logger.setLevel(logging.DEBUG)
             
@@ -2130,13 +1997,8 @@ class AdvancedUBMGenerator:
             # Full-mode derived computations
             # ============================================================
             if not cache_loaded:
-                if (
-                    self.sku_properties_for_join is not None
-                    and "emb_str" in self.sku_properties_for_join.columns
-                ):
-                    self._cluster_sku_embeddings()
-
-                self._build_url_graph_embeddings()
+                # Retailrocket provides behavioral events, categories and
+                # availability, but no validated product-name or URL embeddings.
                 self._segment_users()
                 self._build_global_centralities()
 
@@ -2170,53 +2032,6 @@ class AdvancedUBMGenerator:
               .sort("timestamp")
               .collect(engine='streaming')
         )
-
-    # ------------------------------------------------------------------ #
-    # === Helpers extraits de load_data (lazy-aware) ==================== #
-    def _cluster_sku_embeddings(self) -> None:
-        """Version corrigée avec protection contre arrays vides"""
-        if self.lazy_all is None:
-            return
-        
-        lf = (
-            self.lazy_all
-              .filter(pl.col("emb_str").is_not_null())
-              .select(["sku", "emb_str"])       
-              .unique()
-        )
-        prop_emb = lf.collect(engine='streaming')
-        if prop_emb.is_empty():
-            self.logger.info("No embedding rows to cluster.")
-            return
-    
-        skus, vecs = [], []
-        for row in prop_emb.iter_rows(named=True):
-            try:
-                arr = np.fromstring(row["emb_str"].strip("[]"), sep=" ")
-                if arr.size > 0:  # Check array not empty
-                    norm = np.linalg.norm(arr)
-                    if norm > 0:
-                        vecs.append(arr / norm)
-                        skus.append(int(row["sku"]))
-            except Exception:
-                continue
-    
-        if vecs and len(vecs) > 0:  # Extra check
-            try:
-                X = np.vstack(vecs)
-                if X.shape[0] > 0:  # Ensure we have rows
-                    n_clusters = min(50, X.shape[0])  # Don't use more clusters than samples
-                    mbk = MiniBatchKMeans(n_clusters=n_clusters, batch_size=4096, random_state=42).fit(X)
-                    self.sku_cluster_map = {sku: int(lbl) for sku, lbl in zip(skus, mbk.labels_)}
-                    self.logger.info(f"Built SKU clusters for {len(self.sku_cluster_map)} SKUs.")
-                else:
-                    self.logger.info("No valid embeddings after vstack.")
-            except Exception as e:
-                self.logger.error(f"SKU clustering failed: {e}")
-        else:
-            self.logger.info("No valid embeddings for SKU clustering.")
-
-
     # ─────────────────────────────────────────────────────────────
     #  AdvancedUBMGenerator._build_url_graph_embeddings  (NEW)
     # ─────────────────────────────────────────────────────────────
@@ -3392,12 +3207,6 @@ class AdvancedUBMGenerator:
             else:
                 available_columns = set()
 
-            if self.top_skus:
-                self._extractors["top_sku"] = TopSKUFeatureExtractor(self)
-
-            if self.top_categories:
-                self._extractors["top_category"] = TopCategoryFeatureExtractor(self)
-
             if "category_id" in available_columns or "sku" in available_columns:
                 self._extractors["graph"] = GraphFeatureExtractor(self)
 
@@ -3415,18 +3224,6 @@ class AdvancedUBMGenerator:
 
             if self.product_popularity is not None:
                 self._extractors["social"] = SocialFeatureExtractor(self)
-
-            has_name_embeddings = any(
-                isinstance(props.get("name"), str)
-                and props["name"].startswith("[")
-                and props["name"].endswith("]")
-                for props in self.sku_properties_dict.values()
-            )
-            if has_name_embeddings:
-                self._extractors["name_embedding"] = NameEmbeddingExtractor(self)
-
-            if getattr(self, "sku_cluster_map", None):
-                self._extractors["custom_behavior"] = CustomBehaviorFeatureExtractor(self)
 
             self.logger.info(
                 f"Initialized extractors: {list(self._extractors.keys())}"
@@ -3549,24 +3346,6 @@ class AdvancedUBMGenerator:
                 )
                 parts.append(f"AVAIL:[{availability_token}]")
 
-            price = props.get('price')
-            if price is not None:
-                parts.append(f"PRICE:[PRICE_{price}]")
-
-            name_emb = props.get('name')
-            if isinstance(name_emb, str) and name_emb.startswith('[') and name_emb.endswith(']'):
-                clean = name_emb.strip('[]').replace(',', ' ')
-                parts.append(f"NAME_EMB:[{clean}]")
-
-        elif etype == 'page_visit' and event_row.get('url'):
-            parts.append(f"URL:[URL_{event_row['url']}]")
-        elif etype == 'search_query' and event_row.get('query'):
-            q = event_row['query']
-            if isinstance(q, str) and q.startswith('[') and q.endswith(']'):
-                clean = q.strip('[]').replace(',', ' ')
-                parts.append(f"QUERY_EMB:[{clean}]")
-            else:
-                parts.append("QUERY_EMB:[InvalidFormat]")
         if hasattr(self, 'pop_score_by_sku') and self.pop_score_by_sku:
             score = self.pop_score_by_sku.get(sku_int)
             q_tag = pop_bin(score)
@@ -4062,10 +3841,6 @@ class AdvancedUBMGenerator:
                 "availability":     "AVAILABILITY",
                 "intent":           "OVERVIEW",
                 "graph":            "CUSTOM",
-                "name_embedding":   "CUSTOM",
-                "custom_behavior":  "CUSTOM",
-                "top_sku":          "SKU_PROPENSITY",
-                "top_category":     "CAT_PROPENSITY",
             }
 
             for ex_name, extractor in extractors.items():
@@ -4669,46 +4444,3 @@ class TextRepresentationGenerator:
                 f.write("\n")
 
         logger.info("✅  Representations saved.")
-
-
-class CustomBehaviorFeatureExtractor(FeatureExtractorBase):
-    """20+ nouvelles features issues du clustering SKU, Node2Vec, RFM quantiles…"""
-    def extract_features(self, client_id: int, events: pl.DataFrame, now: datetime) -> List[str]:
-        f = []
-        # — SKU cluster shares
-        skus = events.filter(pl.col('sku').is_not_null())['sku'].to_list()
-        if hasattr(self.parent, 'sku_cluster_map'):
-            cnt = Counter(self.parent.sku_cluster_map.get(int(s), -1) for s in skus)
-            total = sum(cnt.values()) or 1
-            top = cnt.most_common(3)
-            f.append("SKU_CLUSTER_SHARES:")
-            for cid, c in top:
-                f.append(f"  - C{cid}: {c/total:.0%}")
-        # — URL embedding similarity mean
-        ulist = events.filter(pl.col('url').is_not_null())['url'].to_list()
-        sims = []
-        for u in ulist:
-            vec = self.parent.url_embed.get(f"U_{u}")
-            if vec is not None:
-                sims.append(np.dot(vec, self.parent.url_centroid))
-        if sims:
-            f.append(f"URL_EMB_SIM: {float(np.mean(sims)):.3f}")
-        # — temporal cyclic features
-        hrs = events['timestamp'].dt.hour().to_numpy()
-        days = events['timestamp'].dt.weekday().to_numpy()
-        cyc = np.vstack([
-            np.sin(2*np.pi*hrs/24), np.cos(2*np.pi*hrs/24),
-            np.sin(2*np.pi*days/7), np.cos(2*np.pi*days/7)
-        ]).T
-        if len(cyc)>0:
-            mean_cyc = np.round(cyc.mean(axis=0),2).tolist()
-            f.append(f"TIME_CYCLIC_MEAN: {mean_cyc}")
-        # — RFM quantile for recency
-        recs = np.array(self.parent.global_stats.get('rfm_recencies',[]))
-        if recs.size>0:
-            last_buy = events.filter(pl.col('event_type')=='product_buy')['timestamp'].max()
-            if last_buy:
-                r = (now - last_buy).days
-                q = float((recs <= r).sum()/len(recs))
-                f.append(f"RFM_REC_Q: {q:.2f}")
-        return f
