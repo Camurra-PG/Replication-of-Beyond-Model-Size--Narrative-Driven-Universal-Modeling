@@ -70,7 +70,7 @@ IMPLICIT_WEIGHT_REPEAT   : int = 2     # repeat high‑weight tokens N times
 SECTIONS_ORDER: List[str] = [
     "OVERVIEW",           # Garde en premier pour le contexte
     "CHURN_PROPENSITY",   # NOUVEAU: Signaux critiques pour la tâche
-    "TARGET_WINDOW_14D",  # Activité récente (important pour churn)
+    "RECENT_HISTORY_14D",  # Activité récente (important pour churn)
     "TEMPORAL",           # Patterns temporels
     "SEQUENCE",           # Séquences comportementales
     "PRICE",              # Sensibilité prix
@@ -85,7 +85,7 @@ SECTIONS_ORDER: List[str] = [
 SECTION_MARKERS = {
     "OVERVIEW": "[PROFILE]",
     "CHURN_PROPENSITY": "[CHURN]",
-    "TARGET_WINDOW_14D": "[RECENT]",
+    "RECENT_HISTORY_14D": "[RECENT_HISTORY]",
     "TEMPORAL": "[TIME]",
     "SEQUENCE": "[SEQ]",
     "PRICE": "[PRICE]",
@@ -1391,18 +1391,28 @@ class SocialFeatureExtractor(FeatureExtractorBase):
                     (pl.col('event_type') == 'page_visit')
                     & pl.col('category_id').is_not_null()
                 )
-                if page_visits.height >= 10:            # au moins 10 vues
+                if page_visits.height >= 10:
                     cat_cnts = (
-                        page_visits.group_by('category_id')
-                                   .agg(pl.count().alias('cnt'))
-                                   .sort('cnt', descending=True)
+                        page_visits
+                        .group_by("category_id")
+                        .agg(pl.len().alias("cnt"))
+                        .sort("cnt", descending=True)
                     )
-                    total_views = cat_cnts['cnt'].sum()
-                    top_share   = cat_cnts.row(0)['cnt'] / total_views
-                    if top_share >= 0.75:
-                        features.append("Browsing highly concentrated on one category")
-                    elif top_share <= 0.40 and cat_cnts.height >= 3:
-                        features.append("Browsing spread across many categories")
+
+                    total_views = cat_cnts["cnt"].sum()
+
+                    if total_views and total_views > 0:
+                        top_row = cat_cnts.row(0, named=True)
+                        top_share = top_row["cnt"] / total_views
+
+                        if top_share >= 0.75:
+                            features.append(
+                                "Browsing highly concentrated on one category"
+                            )
+                        elif top_share <= 0.40 and cat_cnts.height >= 3:
+                            features.append(
+                                "Browsing spread across many categories"
+                            )
 
             # ---------- 5) Différence vue ↔ panier ----------
             view_events = product_events.filter(
@@ -1732,6 +1742,8 @@ class AdvancedUBMGenerator:
         # We will derive popular SKUs and categories from training data later.  
         self.top_skus: list[int] = []
         self.top_categories: list[int] = []
+        self.dataset_end: Optional[datetime] = None
+        self.reference_time: Optional[datetime] = None
 
 
         self.logger = logging.getLogger(self.__class__.__name__)
@@ -1915,14 +1927,18 @@ class AdvancedUBMGenerator:
         self._extractors = {}
         gc.collect()
 
-    def load_data(self,
-                      use_cache: bool = True,
-                      relevant_client_ids: Optional[List[int]] = None) -> None:
+    def load_data(
+        self,
+        use_cache: bool = True,
+        relevant_client_ids: Optional[List[int]] = None,
+        observation_end: Optional[datetime] = None,
+    ) -> None:
             """
             Entry-point: builds lazy pipeline from parquet sources and joins.
             """
             self.logger.info(f"=== load_data called with use_cache={use_cache}, "
-                             f"relevant_clients={len(relevant_client_ids) if relevant_client_ids else 'None'}")
+                             f"relevant_clients={len(relevant_client_ids) if relevant_client_ids else 'None'}, "
+                             f"observation_end={observation_end}")
             
                         # ============================================================
             # Load Retailrocket source data
@@ -1980,24 +1996,40 @@ class AdvancedUBMGenerator:
             # Optional filtering for fast local tests.
             # Dataset-relative reference time must be computed before optional
             # debug filtering, otherwise each test user appears artificially recent.
-            reference_df = (
+                        # ============================================================
+            # Determine temporal observation boundary
+            # ============================================================
+            dataset_end_df = (
                 lf_all
-                .select(pl.col("timestamp").max().alias("reference_time"))
+                .select(pl.col("timestamp").max().alias("dataset_end"))
                 .collect(engine="streaming")
             )
-            self.reference_time = reference_df["reference_time"][0]
+            self.dataset_end = dataset_end_df["dataset_end"][0]
 
-            self.logger.info(
-                f"Retailrocket global reference time set to {self.reference_time}"
-            )
+            if self.dataset_end is None:
+                raise ValueError("Retailrocket dataset contains no valid timestamps.")
 
-            # Optional filtering for fast local tests.
-            if relevant_client_ids is not None:
+            # When observation_end is provided, all profiles and global
+            # statistics must be built only from historical events.
+            self.reference_time = observation_end or self.dataset_end
+
+            if observation_end is not None:
                 self.logger.info(
-                    f"Filtering Retailrocket events to {len(relevant_client_ids)} clients"
+                    f"Using observation cutoff: {self.reference_time}"
                 )
                 lf_all = lf_all.filter(
-                    pl.col("client_id").is_in(relevant_client_ids)
+                    pl.col("timestamp") < pl.lit(self.reference_time)
+                )
+            else:
+                self.logger.info(
+                    f"Retailrocket global reference time set to {self.reference_time}"
+                )
+
+        
+            if relevant_client_ids is not None:
+                self.logger.info(
+                    f"Keeping full observation history for global statistics; "
+                    f"{len(relevant_client_ids)} clients selected for profile testing"
                 )
 
             # ============================================================
@@ -2024,12 +2056,24 @@ class AdvancedUBMGenerator:
                 ])
                 .filter(pl.col("property") == "categoryid")
                 .select([
-                    pl.col("itemid").cast(pl.Int64).alias("sku"),
-                    pl.col("timestamp").cast(pl.Int64).alias("property_timestamp"),
-                    pl.col("value").cast(pl.Int64, strict=False).alias("category_id"),
+                    pl.col("itemid")
+                      .cast(pl.Int64)
+                      .alias("sku"),
+
+                    pl.from_epoch(
+                        pl.col("timestamp").cast(pl.Int64),
+                        time_unit="ms"
+                    ).alias("property_timestamp"),
+
+                    pl.col("value")
+                      .cast(pl.Int64, strict=False)
+                      .alias("category_id"),
                 ])
-                .filter(pl.col("category_id").is_not_null())
-                .sort("property_timestamp")
+                .filter(
+                    pl.col("category_id").is_not_null()
+                    & (pl.col("property_timestamp") <= pl.lit(self.reference_time))
+                )
+                .sort(["sku", "property_timestamp"])
                 .group_by("sku")
                 .agg(
                     pl.col("category_id").last().alias("category_id")
@@ -3858,7 +3902,7 @@ class AdvancedUBMGenerator:
             )
 
             if recent_txt != "No recent activity.":
-                section_map["TARGET_WINDOW_14D"].append(recent_txt)
+                section_map["RECENT_HISTORY_14D"].append(recent_txt)
             if medium_txt != "No medium-term activity.":
                 section_map["SEQUENCE"].append(medium_txt)
             if hist_txt != "No historical activity.":
