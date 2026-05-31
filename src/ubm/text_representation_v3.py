@@ -1839,168 +1839,6 @@ class AdvancedUBMGenerator:
         if self.debug_mode:
             self.logger.setLevel(logging.DEBUG)
             
-    def _setup_lazy_pipeline_only(self) -> None:
-        """
-        Set up the lazy pipeline without collecting any data.
-        Used by streaming generator to avoid double loading.
-        """
-        self.logger.info("Setting up lazy pipeline (no data collection)")
-        
-        # 1) Load product properties for join if available
-        props_path = self.data_dir / "product_properties.parquet"
-        if props_path.exists():
-            prop = pl.read_parquet(props_path)
-            emb_source = None
-            if "embedding" in prop.columns:
-                emb_source = "embedding"
-            elif "name" in prop.columns:
-                # Check if it looks like an embedding
-                sample = prop["name"].head(1)
-                if sample.len() > 0 and str(sample[0]).strip().startswith("["):
-                    emb_source = "name"
-    
-            cols = ["sku", "category", "price"] + ([emb_source] if emb_source else [])
-            tmp = prop.select(cols)
-            rename_map = {"category": "category_id", "price": "price_bucket"}
-            if emb_source:
-                rename_map[emb_source] = "emb_str"
-            self.sku_properties_for_join = tmp.rename(rename_map).with_columns(
-                pl.col("sku").cast(pl.Int64)
-            )
-            # Note: sku_properties_dict should already be loaded from cache
-        
-        # 2) Build lazy scans & union
-        event_types = ["product_buy", "add_to_cart", "remove_from_cart", "page_visit", "search_query"]
-        schema = {
-            "client_id": pl.Int64,
-            "timestamp": pl.Datetime("us"),
-            "sku": pl.Int64,
-            "url": pl.Utf8,
-            "query": pl.Utf8
-        }
-    
-        lazy_sources = []
-        for et in event_types:
-            fp = self.data_dir / f"{et}.parquet"
-            if not fp.exists():
-                self.logger.warning(f"Skipping missing file {fp}")
-                continue
-            
-            scan = pl.scan_parquet(fp)
-            lf_schema = scan.collect_schema()
-            
-            exprs = []
-            for col, dt in schema.items():
-                if col in lf_schema:
-                    col_expr = pl.col(col)
-                    if lf_schema[col] != dt:
-                        if col == "timestamp":
-                            col_expr = col_expr.cast(pl.Utf8).str.to_datetime(
-                                strict=False, time_unit="us"
-                            ).cast(dt)
-                        else:
-                            col_expr = col_expr.cast(dt, strict=False)
-                    exprs.append(col_expr.alias(col))
-                else:
-                    exprs.append(pl.lit(None).cast(dt).alias(col))
-            
-            exprs.append(pl.lit(et).alias("event_type"))
-            lazy_sources.append(scan.select(exprs))
-    
-        if not lazy_sources:
-            raise ValueError("No event files found.")
-    
-        # Union all sources
-        lf_all = pl.concat(lazy_sources)
-    
-        # 3) Join product properties lazily
-        if self.sku_properties_for_join is not None:
-            lf_all = lf_all.join(
-                self.sku_properties_for_join.lazy(),
-                on="sku",
-                how="left"
-            )
-    
-        # 4) Store the lazy pipeline
-        self.lazy_all = lf_all
-        
-        # 5) Initialize centrality attributes if not already present
-        if not hasattr(self, 'sku_centrality'):
-            self.sku_centrality = {}
-        if not hasattr(self, 'cat_centrality'):
-            self.cat_centrality = {}
-        if not hasattr(self, 'category_centrality'):
-            self.category_centrality = {}
-        
-        # Initialize URL embedding attributes
-        if not hasattr(self, 'url_embed'):
-            self.url_embed = {}
-        if not hasattr(self, 'url_centroid'):
-            self.url_centroid = None
-        if not hasattr(self, 'url_cluster_map'):
-            self.url_cluster_map = {}
-        
-        # Initialize SKU clustering attributes  
-        if not hasattr(self, 'sku_cluster_map'):
-            self.sku_cluster_map = {}
-        
-        # Initialize user segments if not present
-        if not hasattr(self, 'user_segments'):
-            self.user_segments = {}
-        
-        # Initialize popularity score mapping
-        if not hasattr(self, 'pop_score_by_sku'):
-            self.pop_score_by_sku = {}
-            # Try to build it from product_popularity if available
-            if self.product_popularity is not None and 'sku' in self.product_popularity.columns and 'popularity_score' in self.product_popularity.columns:
-                try:
-                    self.pop_score_by_sku = {
-                        int(row['sku']): float(row['popularity_score']) 
-                        for row in self.product_popularity[['sku', 'popularity_score']].iter_rows(named=True)
-                        if row['sku'] is not None and row['popularity_score'] is not None
-                    }
-                except Exception as e:
-                    self.logger.warning(f"Failed to build pop_score_by_sku: {e}")
-        
-        # Initialize category_popularity if not present
-        if not hasattr(self, 'category_popularity'):
-            self.category_popularity = None
-        
-        # 6) Initialize extractors based on what we know from cache
-        self._extractors = {}
-        self._extractors['temporal'] = TemporalFeatureExtractor(self)
-        self._extractors['sequence'] = SequenceFeatureExtractor(self)
-
-     
-        # Add other extractors based on available data
-        # (we know from the schema what columns are available)
-        if self.sku_properties_for_join is not None:
-            if 'category_id' in self.sku_properties_for_join.columns:
-                self._extractors['graph'] = GraphFeatureExtractor(self)
-            if 'price_bucket' in self.sku_properties_for_join.columns:
-                self._extractors['price'] = PriceFeatureExtractor(self)
-            if 'emb_str' in self.sku_properties_for_join.columns:
-                self._extractors['name_embedding'] = NameEmbeddingExtractor(self)
-        
-        self._extractors['intent'] = IntentFeatureExtractor(self)
-        
-        if self.product_popularity is not None:
-            self._extractors['social'] = SocialFeatureExtractor(self)
-            
-        if self.top_skus:
-            self._extractors['top_sku'] = TopSKUFeatureExtractor(self)
-
-        if self.top_categories:
-            self._extractors['top_category'] = TopCategoryFeatureExtractor(self)
-        
-        # Add ChurnPropensityExtractor if it exists
-        try:
-            self._extractors['churn_propensity'] = ChurnPropensityExtractor(self)
-        except NameError:
-            pass  # ChurnPropensityExtractor not defined
-        
-        self.logger.info("Lazy pipeline ready (no data materialized)")
-            
     def _reset_data(self):
         self.logger.warning("Resetting internal dataframes and stats.")
         self.lazy_all = None
@@ -2020,8 +1858,13 @@ class AdvancedUBMGenerator:
         relevant_client_ids: Optional[List[int]] = None,
         observation_end: Optional[datetime] = None,
     ) -> None:
-            """
-            Entry-point: builds lazy pipeline from parquet sources and joins.
+            """            
+            Build the Retailrocket event pipeline and derived profile features.
+    
+            Events are loaded from events.csv and enriched with confirmed
+            Retailrocket item properties: category_id and time-dependent
+            availability. If observation_end is provided, only earlier
+            interactions are used for profile construction and global statistics.
             """
             self.logger.info(f"=== load_data called with use_cache={use_cache}, "
                              f"relevant_clients={len(relevant_client_ids) if relevant_client_ids else 'None'}, "
@@ -3593,18 +3436,24 @@ class AdvancedUBMGenerator:
 
 
     def get_client_events(self, client_id: int) -> pl.DataFrame:
-        """Ne charge que les events d'UN client"""
-        # PRIORITÉ au mode streaming
+        """
+        Return all loaded Retailrocket history events for one client.
+
+        The preferred path reads from the lazy Retailrocket event pipeline.
+        In debug mode, a previously materialized test subset may be used.
+        """
         if self.lazy_all is not None:
             return self._collect_client_events(client_id)
-        # Fallback si pas de lazy pipeline
-        elif self.events_df is not None:
-            return self.events_df.filter(pl.col('client_id') == client_id)
-        # Dernier recours : scan direct
-        else:
-            return pl.scan_parquet(self.cache_dir / "events_1m_clients.parquet")\
-                     .filter(pl.col('client_id') == client_id)\
-                     .collect()
+
+        if self.events_df is not None:
+            return self.events_df.filter(
+                pl.col("client_id") == client_id
+            )
+
+        raise RuntimeError(
+            "No Retailrocket event pipeline is available. "
+            "Call load_data() before generating representations."
+        )
 
 
 
