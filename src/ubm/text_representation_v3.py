@@ -74,7 +74,7 @@ SECTIONS_ORDER: List[str] = [
     "TEMPORAL",           # Patterns temporels
     "SEQUENCE",           # Séquences comportementales
     "PRICE", 
-    "AVAILABILITY"             # Sensibilité prix
+    "AVAILABILITY",             # Sensibilité prix
     "SOCIAL",             # Facteurs sociaux
     "SKU_PROPENSITY",  
     "CAT_PROPENSITY",  
@@ -3965,18 +3965,59 @@ class AdvancedUBMGenerator:
             }
 
             for ex_name, extractor in extractors.items():
-                tgt_sec = ex_to_sec.get(ex_name, "CUSTOM")
+                default_sec = ex_to_sec.get(ex_name, "CUSTOM")
+
                 try:
                     feats = extractor.extract_features(cid, events, now)
                 except Exception as err:
+                    self.logger.error(
+                        f"Feature extraction failed for {ex_name}, client {cid}: {err}"
+                    )
                     feats = [f"{ex_name}-error"]
 
-                # ↓↓↓  répétition implicite uniquement pour top_sku
-                repeat = IMPLICIT_WEIGHT_REPEAT if ex_name in ("top_sku", "top_category") else 1
+                repeat = (
+                    IMPLICIT_WEIGHT_REPEAT
+                    if ex_name in ("top_sku", "top_category")
+                    else 1
+                )
+
                 for ft in feats:
+                    target_sec = default_sec
+
+                    # The churn_propensity extractor returns several logical
+                    # feature groups, so route them by their prefix.
+                    if ex_name == "churn_propensity":
+                        if ft.startswith((
+                            "CHURN_",
+                            "PURCHASE_RECENCY:",
+                            "PURCHASE_PATTERN:",
+                            "AVG_PURCHASE_INTERVAL:",
+                            "POST_PURCHASE",
+                            "LTV_INDICATOR:",
+                        )):
+                            target_sec = "CHURN_PROPENSITY"
+
+                        elif ft.startswith((
+                            "CAT_PROPENSITY:",
+                            "CAT_EXPLORATION_BREADTH:",
+                            "PURCHASE_CAT_FOCUS:",
+                        )):
+                            target_sec = "CAT_PROPENSITY"
+
+                        elif ft.startswith((
+                            "SKU_PROPENSITY",
+                            "REPEAT_PURCHASE_SKUS:",
+                            "TOP_REPEAT_SKU:",
+                        )):
+                            target_sec = "SKU_PROPENSITY"
+
                     for _ in range(repeat):
-                        section_map[tgt_sec].append(ft)
-                    features_json.append({"type": ex_name, "value": ft})
+                        section_map[target_sec].append(ft)
+
+                    features_json.append({
+                        "type": ex_name,
+                        "value": ft,
+                    })
             
             for t in extra_tags:
                 features_list.append({"type": "extra", "value": t})
@@ -4069,15 +4110,13 @@ class AdvancedUBMGenerator:
             # ==============================================================
             # 5)  RAW SEQUENCE  -------------------------------------------
             # ==============================================================
+            # Keep the raw chronological event sequence separate from the
+            # shuffled feature sections. It is appended once after the rich
+            # profile text has been built.
             raw_seq = self._generate_raw_sequence(
-                events, max_events=RAW_SEQUENCE_LAST_EVENTS
+                events,
+                max_events=RAW_SEQUENCE_LAST_EVENTS,
             )
-            section_map["CUSTOM"].append("## RAW_SEQUENCE ##")
-            section_map["CUSTOM"].append("```")        # ← ouverture du bloc code
-            section_map["CUSTOM"].append(raw_seq)      # ← contenu brut
-            section_map["CUSTOM"].append("```")        # ← fermeture du bloc code
-            section_map["CUSTOM"].append("RAW_SEQUENCE (derniers 50 événements)…")
-            section_map["CUSTOM"].append("</s>".join(raw_seq.split("</s>")[-50:]))
 
             section_map["CUSTOM"] = list(dict.fromkeys(section_map["CUSTOM"]))
 
