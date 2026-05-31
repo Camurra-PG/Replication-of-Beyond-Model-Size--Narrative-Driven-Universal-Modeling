@@ -2270,11 +2270,17 @@ class AdvancedUBMGenerator:
     
             # Sauvegarder le cache en mode normal
             if use_cache and not self.debug_mode:
-                df_all = lf_all.sort(["client_id", "timestamp"]).collect(engine='streaming')
-                self.events_df = df_all
-                df_all.write_parquet(cache_file)
-                self._save_calculated_data_to_cache()
-                self.logger.info("Cache rebuilt and saved.")
+                if observation_end is None:
+                    self._save_calculated_data_to_cache()
+                    self.logger.info(
+                        "Saved derived Retailrocket statistics to cache. "
+                        "Event data remains lazy."
+                    )
+                else:
+                    self.logger.info(
+                        "Skipping shared derived-cache write for cutoff-based run "
+                        "to avoid mixing temporal evaluation states."
+                    )
             
     def _collect_client_events(self, client_id: int) -> pl.DataFrame:
         """Pulls down only one client's events into memory."""
@@ -3299,42 +3305,74 @@ class AdvancedUBMGenerator:
 
     # --- Getters ---
     def get_feature_extractors(self) -> Dict[str, FeatureExtractorBase]:
-        if not self._extractors:
+            """
+            Initialize feature extractors from the available Retailrocket schema.
+
+            Important:
+            In normal/full-run mode we keep the data lazy and do not materialize
+            the complete event table into self.events_df. Therefore extractor
+            activation must be based on the lazy schema whenever possible.
+            """
+            if self._extractors:
+                return self._extractors
+
             self.logger.debug("Initializing feature extractors...")
-            self._extractors = {}
-            self._extractors['temporal'] = TemporalFeatureExtractor(self)
-            self._extractors['sequence'] = SequenceFeatureExtractor(self)
-            self._extractors['churn_propensity'] = ChurnPropensityFeatureExtractor(self)
+
+            self._extractors = {
+                "temporal": TemporalFeatureExtractor(self),
+                "sequence": SequenceFeatureExtractor(self),
+                "churn_propensity": ChurnPropensityFeatureExtractor(self),
+            }
+
+            # Determine available columns without forcing complete materialization.
+            if self.lazy_all is not None:
+                available_columns = set(self.lazy_all.collect_schema().names())
+            elif self.events_df is not None:
+                available_columns = set(self.events_df.columns)
+            else:
+                available_columns = set()
+
             if self.top_skus:
-                self._extractors['top_sku'] = TopSKUFeatureExtractor(self)
+                self._extractors["top_sku"] = TopSKUFeatureExtractor(self)
+
             if self.top_categories:
-                self._extractors['top_category'] = TopCategoryFeatureExtractor(self)
+                self._extractors["top_category"] = TopCategoryFeatureExtractor(self)
 
-            if self.events_df is not None:
-                if 'category_id' in self.events_df.columns or 'sku' in self.events_df.columns:
-                    self._extractors['graph'] = GraphFeatureExtractor(self)
-                if 'query' in self.events_df.columns:
-                    self._extractors['intent'] = IntentFeatureExtractor(self)
-                if 'price_bucket' in self.events_df.columns:
-                    self._extractors['price'] = PriceFeatureExtractor(self)
-                if "is_available" in self.events_df.columns:
-                    self._extractors["availability"] = AvailabilityFeatureExtractor(self)
-                if self.product_popularity is not None:
-                    self._extractors['social'] = SocialFeatureExtractor(self)
-                has_name_embeddings = any(
-                    isinstance(props.get("name"), str)
-                    and props["name"].startswith("[")
-                    and props["name"].endswith("]")
-                    for props in self.sku_properties_dict.values()
-                )
+            if "category_id" in available_columns or "sku" in available_columns:
+                self._extractors["graph"] = GraphFeatureExtractor(self)
 
-                if has_name_embeddings:
-                    self._extractors["name_embedding"] = NameEmbeddingExtractor(self)
-                if hasattr(self, 'sku_cluster_map'):
-                    self._extractors['custom_behavior'] = CustomBehaviorFeatureExtractor(self)
+            # We retain the intent extractor because it also creates funnel and
+            # cart-behavior features. For Retailrocket, search-specific output
+            # correctly reports that no search events exist.
+            if "event_type" in available_columns:
+                self._extractors["intent"] = IntentFeatureExtractor(self)
 
-            self.logger.info(f"Initialized extractors: {list(self._extractors.keys())}")
-        return self._extractors
+            if "price_bucket" in available_columns:
+                self._extractors["price"] = PriceFeatureExtractor(self)
+
+            if "is_available" in available_columns:
+                self._extractors["availability"] = AvailabilityFeatureExtractor(self)
+
+            if self.product_popularity is not None:
+                self._extractors["social"] = SocialFeatureExtractor(self)
+
+            has_name_embeddings = any(
+                isinstance(props.get("name"), str)
+                and props["name"].startswith("[")
+                and props["name"].endswith("]")
+                for props in self.sku_properties_dict.values()
+            )
+            if has_name_embeddings:
+                self._extractors["name_embedding"] = NameEmbeddingExtractor(self)
+
+            if getattr(self, "sku_cluster_map", None):
+                self._extractors["custom_behavior"] = CustomBehaviorFeatureExtractor(self)
+
+            self.logger.info(
+                f"Initialized extractors: {list(self._extractors.keys())}"
+            )
+
+            return self._extractors
 
 
     def get_client_events(self, client_id: int) -> pl.DataFrame:
