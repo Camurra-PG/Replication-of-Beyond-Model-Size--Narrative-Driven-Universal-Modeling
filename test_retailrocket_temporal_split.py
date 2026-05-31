@@ -18,7 +18,7 @@ raw_events = (
     .with_columns(
         pl.from_epoch(
             pl.col("timestamp").cast(pl.Int64),
-            time_unit="ms"
+            time_unit="ms",
         ).alias("event_time")
     )
 )
@@ -68,7 +68,7 @@ eligible_users = (
 if eligible_users.is_empty():
     raise RuntimeError("No eligible temporal-split test user found.")
 
-client_id = eligible_users["visitorid"][0]
+client_id = int(eligible_users["visitorid"][0])
 print("Testing client:", client_id)
 
 # ------------------------------------------------------------
@@ -98,14 +98,49 @@ print("\nHistory event count:")
 print(history.height)
 
 assert generator.reference_time == cutoff
-assert history["timestamp"].max() < cutoff
+assert history["timestamp"].max() < cutoff, (
+    "Temporal leakage detected: an event from the target window "
+    "entered the observation history."
+)
 
+# ------------------------------------------------------------
+# Generate historical-only representation
+# ------------------------------------------------------------
 representations = generator.generate_representations([client_id])
 payload = json.loads(representations[client_id])
+rich_text = payload["rich_text"]
 
 print("\nTemporal split verified: no target-window events entered the profile.")
+
 print("\nProfile user type based only on history:")
 print(payload["profile"]["overview"]["user_type"])
 
+# ------------------------------------------------------------
+# Verify Retailrocket global-popularity features from history only
+# ------------------------------------------------------------
+top_lines = [
+    line
+    for line in rich_text.splitlines()
+    if line.startswith("GLOBAL_TOP_")
+]
+
+print("\nContains GLOBAL_POPULARITY section:")
+print("[TOP]" in rich_text)
+
+print("\nGLOBAL_POPULARITY feature lines:")
+for line in top_lines:
+    print(line)
+
+assert "[TOP]" in rich_text, (
+    "Expected GLOBAL_POPULARITY section for the selected historical client."
+)
+
+assert top_lines, (
+    "Expected at least one GLOBAL_TOP feature in the historical profile."
+)
+
+# ------------------------------------------------------------
+# Preview output
+# ------------------------------------------------------------
 print("\nRich text preview:")
-print(payload["rich_text"][:1500])
+print(rich_text[:3000])

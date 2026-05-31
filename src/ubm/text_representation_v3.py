@@ -66,22 +66,24 @@ if not logger.hasHandlers():
 MAX_RICH_TOKENS          : int = 4096  # set to 2048 if you want shorter texts
 TOP_FEATURES_PER_SECTION : int = 10    # soft‑cap per section before trimming
 IMPLICIT_WEIGHT_REPEAT   : int = 2     # repeat high‑weight tokens N times
+TOP_RETAILROCKET_SKUS: int = 100
+TOP_RETAILROCKET_CATEGORIES: int = 100
 SECTIONS_ORDER: List[str] = [
-    "OVERVIEW",           # Garde en premier pour le contexte
-    "CHURN_PROPENSITY",   # NOUVEAU: Signaux critiques pour la tâche
-    "RECENT_HISTORY_14D",  # Activité récente (important pour churn)
-    "TEMPORAL",           # Patterns temporels
-    "SEQUENCE",           # Séquences comportementales
-    "PRICE", 
-    "AVAILABILITY",             # Sensibilité prix
-    "SOCIAL",             # Facteurs sociaux
-    "SKU_PROPENSITY",  
-    "CAT_PROPENSITY",  
+    "OVERVIEW",
+    "CHURN_PROPENSITY",
+    "RECENT_HISTORY_14D",
+    "TEMPORAL",
+    "SEQUENCE",
+    "PRICE",
+    "AVAILABILITY",
+    "SOCIAL",
+    "GLOBAL_POPULARITY",
+    "SKU_PROPENSITY",
+    "CAT_PROPENSITY",
     "PROP_SUBSET_STATS",
     "CUSTOM",
 ]
 
-# Ajouter ces constantes après SECTIONS_ORDER
 SECTION_MARKERS = {
     "OVERVIEW": "[PROFILE]",
     "CHURN_PROPENSITY": "[CHURN]",
@@ -91,10 +93,11 @@ SECTION_MARKERS = {
     "PRICE": "[PRICE]",
     "AVAILABILITY": "[AVAIL]",
     "SOCIAL": "[SOCIAL]",
+    "GLOBAL_POPULARITY": "[TOP]",
     "SKU_PROPENSITY": "[SKU]",
     "CAT_PROPENSITY": "[CAT]",
     "PROP_SUBSET_STATS": "[STATS]",
-    "CUSTOM": "[MISC]"
+    "CUSTOM": "[MISC]",
 }
 
 # ---------------------------------------------------------------------------
@@ -299,9 +302,14 @@ def _build_rich_text(
             else:
                 repeated.append(item)
 
-        # 3. Shuffle léger pour la variété (sauf les premières)
-        if len(repeated) > 3:
-            first_items = repeated[:2]  # Garde les 2 premiers
+        ordered_sections = {
+            "GLOBAL_POPULARITY",
+            "SKU_PROPENSITY",
+            "CAT_PROPENSITY",
+        }
+
+        if len(repeated) > 3 and section not in ordered_sections:
+            first_items = repeated[:2]
             rest_items = repeated[2:]
             rnd.shuffle(rest_items)
             repeated = first_items + rest_items
@@ -1526,6 +1534,185 @@ class SocialFeatureExtractor(FeatureExtractorBase):
             self.logger.debug(f"Err popularity: {e}")
             features.append("Err popularity patterns.")
 
+
+class RetailrocketGlobalPopularityFeatureExtractor(FeatureExtractorBase):
+    """
+    Extract a user's interaction coverage with globally popular Retailrocket
+    products and categories.
+
+    The global top sets are derived from product_popularity and
+    category_popularity, which are computed only from the active observation
+    history. Therefore temporal-split runs remain leakage-free.
+    """
+
+    def extract_features(
+        self,
+        client_id: int,
+        events: pl.DataFrame,
+        now: datetime,
+    ) -> List[str]:
+        features: List[str] = []
+
+        self._extract_top_sku_overlap(events, features)
+        self._extract_top_category_overlap(events, features)
+
+        return features
+
+    def _extract_top_sku_overlap(
+        self,
+        events: pl.DataFrame,
+        features: List[str],
+    ) -> None:
+        product_popularity = self.parent.product_popularity
+
+        if (
+            product_popularity is None
+            or product_popularity.is_empty()
+            or "popularity_score" not in product_popularity.columns
+        ):
+            return
+
+        product_events = events.filter(
+            pl.col("sku").is_not_null()
+            & pl.col("event_type").is_in(
+                ["page_visit", "add_to_cart", "product_buy"]
+            )
+        )
+
+        if product_events.is_empty():
+            return
+
+        global_top_skus = (
+            product_popularity
+            .sort("popularity_score", descending=True)
+            .head(TOP_RETAILROCKET_SKUS)
+            .select(["sku", "popularity_score"])
+        )
+
+        top_rank_by_sku = {
+            int(row["sku"]): rank
+            for rank, row in enumerate(
+                global_top_skus.iter_rows(named=True),
+                start=1,
+            )
+            if row["sku"] is not None
+        }
+
+        matched_events = product_events.filter(
+            pl.col("sku").is_in(list(top_rank_by_sku.keys()))
+        )
+
+        if matched_events.is_empty():
+            return
+
+        coverage = matched_events.height / product_events.height
+        matched_counts = (
+            matched_events
+            .group_by("sku")
+            .agg(pl.len().alias("event_count"))
+            .to_dicts()
+        )
+
+        ranked_matches = sorted(
+            matched_counts,
+            key=lambda row: (
+                top_rank_by_sku[int(row["sku"])],
+                -int(row["event_count"]),
+            ),
+        )
+
+        features.append(
+            f"GLOBAL_TOP_SKU_COVERAGE:{coverage:.1%}"
+        )
+        features.append(
+            f"GLOBAL_TOP_SKU_UNIQUE_HITS:{len(ranked_matches)}"
+        )
+
+        for row in ranked_matches[:3]:
+            sku = int(row["sku"])
+            features.append(
+                f"GLOBAL_TOP_SKU_HIT:SKU_{sku}"
+                f"(rank={top_rank_by_sku[sku]},events={int(row['event_count'])})"
+            )
+
+    def _extract_top_category_overlap(
+        self,
+        events: pl.DataFrame,
+        features: List[str],
+    ) -> None:
+        category_popularity = self.parent.category_popularity
+
+        if (
+            category_popularity is None
+            or category_popularity.is_empty()
+            or "category_popularity_score" not in category_popularity.columns
+            or "category_id" not in events.columns
+        ):
+            return
+
+        category_events = events.filter(
+            pl.col("category_id").is_not_null()
+            & pl.col("event_type").is_in(
+                ["page_visit", "add_to_cart", "product_buy"]
+            )
+        )
+
+        if category_events.is_empty():
+            return
+
+        global_top_categories = (
+            category_popularity
+            .sort("category_popularity_score", descending=True)
+            .head(TOP_RETAILROCKET_CATEGORIES)
+            .select(["category_id", "category_popularity_score"])
+        )
+
+        top_rank_by_category = {
+            int(row["category_id"]): rank
+            for rank, row in enumerate(
+                global_top_categories.iter_rows(named=True),
+                start=1,
+            )
+            if row["category_id"] is not None
+        }
+
+        matched_events = category_events.filter(
+            pl.col("category_id").is_in(list(top_rank_by_category.keys()))
+        )
+
+        if matched_events.is_empty():
+            return
+
+        coverage = matched_events.height / category_events.height
+        matched_counts = (
+            matched_events
+            .group_by("category_id")
+            .agg(pl.len().alias("event_count"))
+            .to_dicts()
+        )
+
+        ranked_matches = sorted(
+            matched_counts,
+            key=lambda row: (
+                top_rank_by_category[int(row["category_id"])],
+                -int(row["event_count"]),
+            ),
+        )
+
+        features.append(
+            f"GLOBAL_TOP_CATEGORY_COVERAGE:{coverage:.1%}"
+        )
+        features.append(
+            f"GLOBAL_TOP_CATEGORY_UNIQUE_HITS:{len(ranked_matches)}"
+        )
+
+        for row in ranked_matches[:3]:
+            category_id = int(row["category_id"])
+            features.append(
+                f"GLOBAL_TOP_CATEGORY_HIT:CAT_{category_id}"
+                f"(rank={top_rank_by_category[category_id]},"
+                f"events={int(row['event_count'])})"
+            )
 # --- Main Generator Class ---
 # --- Constants for raw sequence generation ---
 SEP_TOKEN = "</s>"
@@ -1696,8 +1883,6 @@ class AdvancedUBMGenerator:
         self._extractors: Dict[str, Any] = {}
         # Retailrocket has no predefined Synerise propensity target lists.
         # We will derive popular SKUs and categories from training data later.  
-        self.top_skus: list[int] = []
-        self.top_categories: list[int] = []
         self.dataset_end: Optional[datetime] = None
         self.reference_time: Optional[datetime] = None
 
@@ -3225,6 +3410,14 @@ class AdvancedUBMGenerator:
             if self.product_popularity is not None:
                 self._extractors["social"] = SocialFeatureExtractor(self)
 
+            if (
+                self.product_popularity is not None
+                and self.category_popularity is not None
+            ):
+                self._extractors["retailrocket_global_popularity"] = (
+                    RetailrocketGlobalPopularityFeatureExtractor(self)
+                )
+
             self.logger.info(
                 f"Initialized extractors: {list(self._extractors.keys())}"
             )
@@ -3834,15 +4027,15 @@ class AdvancedUBMGenerator:
             compact_tags = self._compute_compact_metrics(events)
             # where to dump each extractor's lines → logical section name
             ex_to_sec = {
-                "temporal":         "TEMPORAL",
-                "sequence":         "SEQUENCE",
-                "social":           "SOCIAL",
-                "price":            "PRICE",
-                "availability":     "AVAILABILITY",
-                "intent":           "OVERVIEW",
-                "graph":            "CUSTOM",
+                "temporal": "TEMPORAL",
+                "sequence": "SEQUENCE",
+                "social": "SOCIAL",
+                "retailrocket_global_popularity": "GLOBAL_POPULARITY",
+                "price": "PRICE",
+                "availability": "AVAILABILITY",
+                "intent": "OVERVIEW",
+                "graph": "CUSTOM",
             }
-
             for ex_name, extractor in extractors.items():
                 default_sec = ex_to_sec.get(ex_name, "CUSTOM")
 
