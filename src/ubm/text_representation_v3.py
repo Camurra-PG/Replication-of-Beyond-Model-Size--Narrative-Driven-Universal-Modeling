@@ -73,7 +73,8 @@ SECTIONS_ORDER: List[str] = [
     "RECENT_HISTORY_14D",  # Activité récente (important pour churn)
     "TEMPORAL",           # Patterns temporels
     "SEQUENCE",           # Séquences comportementales
-    "PRICE",              # Sensibilité prix
+    "PRICE", 
+    "AVAILABLITY"             # Sensibilité prix
     "SOCIAL",             # Facteurs sociaux
     "SKU_PROPENSITY",  
     "CAT_PROPENSITY",  
@@ -89,6 +90,7 @@ SECTION_MARKERS = {
     "TEMPORAL": "[TIME]",
     "SEQUENCE": "[SEQ]",
     "PRICE": "[PRICE]",
+    "AVAILABILITY": "[AVAIL]",
     "SOCIAL": "[SOCIAL]",
     "SKU_PROPENSITY": "[SKU]",
     "CAT_PROPENSITY": "[CAT]",
@@ -2097,6 +2099,58 @@ class AdvancedUBMGenerator:
                 category_properties.lazy(),
                 on="sku",
                 how="left",
+            )
+
+            # ============================================================
+            # Load Retailrocket item availability
+            # ============================================================
+            # Availability is time-dependent. Therefore it must be joined
+            # as of the event timestamp and not as one static value per SKU.
+            availability_properties = (
+                pl.concat([
+                    pl.scan_csv(properties_paths[0]),
+                    pl.scan_csv(properties_paths[1]),
+                ])
+                .filter(pl.col("property") == "available")
+                .select([
+                    pl.col("itemid")
+                      .cast(pl.Int64)
+                      .alias("sku"),
+
+                    pl.from_epoch(
+                        pl.col("timestamp").cast(pl.Int64),
+                        time_unit="ms"
+                    ).alias("property_timestamp"),
+
+                    pl.col("value")
+                      .cast(pl.Int8, strict=False)
+                      .alias("is_available"),
+                ])
+                .filter(
+                    pl.col("is_available").is_not_null()
+                    & (pl.col("property_timestamp") <= pl.lit(self.reference_time))
+                )
+                .sort(["sku", "property_timestamp"])
+                .collect(engine="streaming")
+            )
+
+            self.logger.info(
+                f"Loaded availability history with "
+                f"{availability_properties.height:,} property rows."
+            )
+
+            # Join the most recent availability state known at each event time.
+            lf_all = (
+                lf_all
+                .sort(["sku", "timestamp"])
+                .join_asof(
+                    availability_properties.lazy(),
+                    left_on="timestamp",
+                    right_on="property_timestamp",
+                    by="sku",
+                    strategy="backward",
+                )
+                .drop("property_timestamp")
             )
 
             self.lazy_all = lf_all

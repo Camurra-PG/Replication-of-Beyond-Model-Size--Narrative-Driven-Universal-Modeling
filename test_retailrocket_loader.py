@@ -67,9 +67,8 @@ generator.load_data(
 print("\nLazy pipeline created successfully.")
 
 df = (
-    generator.lazy_all
+    generator.events_df
     .sort(["client_id", "timestamp"])
-    .collect()
 )
 
 # ------------------------------------------------------------
@@ -113,3 +112,23 @@ print(df.filter(pl.col("category_id").is_not_null()).height)
 
 print("\nReference time:")
 print(generator.reference_time)
+
+print("\nAvailability column present:")
+print("is_available" in df.columns)
+
+print("\nRows with availability information:")
+for row in (
+    df.select(
+        ["client_id", "timestamp", "sku", "event_type", "category_id", "is_available"]
+    )
+    .head(10)
+    .to_dicts()
+):
+    print(row)
+
+print("\nAvailability distribution in test sample:")
+print(
+    df.group_by("is_available")
+      .agg(pl.len().alias("count"))
+      .sort("is_available")
+)
