@@ -74,7 +74,7 @@ SECTIONS_ORDER: List[str] = [
     "TEMPORAL",           # Patterns temporels
     "SEQUENCE",           # Séquences comportementales
     "PRICE", 
-    "AVAILABLITY"             # Sensibilité prix
+    "AVAILABILITY"             # Sensibilité prix
     "SOCIAL",             # Facteurs sociaux
     "SKU_PROPENSITY",  
     "CAT_PROPENSITY",  
@@ -1230,6 +1230,91 @@ class PriceFeatureExtractor(FeatureExtractorBase):
         if relevant_discount_cols:
              features.append(f"Discount info present ({', '.join(relevant_discount_cols)}), analysis TBD.")
 
+class AvailabilityFeatureExtractor(FeatureExtractorBase):
+    """Extract stock-availability interaction patterns from Retailrocket."""
+
+    def extract_features(
+        self,
+        client_id: int,
+        events: pl.DataFrame,
+        now: datetime,
+    ) -> List[str]:
+        if "is_available" not in events.columns:
+            return []
+
+        product_events = events.filter(
+            pl.col("event_type").is_in(
+                ["page_visit", "add_to_cart", "product_buy"]
+            )
+            & pl.col("sku").is_not_null()
+        )
+
+        if product_events.is_empty():
+            return []
+
+        known = product_events.filter(
+            pl.col("is_available").is_not_null()
+        )
+
+        if known.is_empty():
+            return ["Availability status unavailable for interactions"]
+
+        features: List[str] = []
+
+        coverage = known.height / product_events.height
+        features.append(
+            f"Availability known for {coverage:.1%} of interactions"
+        )
+
+        available_share = (
+            known.filter(pl.col("is_available") == 1).height / known.height
+        )
+
+        if available_share >= 0.80:
+            features.append("Mostly interacted with available products")
+        elif available_share <= 0.40:
+            features.append("Frequent interaction with unavailable products")
+        else:
+            features.append("Mixed available and unavailable product interactions")
+
+        views = known.filter(pl.col("event_type") == "page_visit")
+        if not views.is_empty():
+            unavailable_views = views.filter(
+                pl.col("is_available") == 0
+            ).height
+
+            if unavailable_views > 0:
+                unavailable_view_share = unavailable_views / views.height
+                features.append(
+                    f"Unavailable product views: {unavailable_view_share:.1%}"
+                )
+
+        carts = known.filter(pl.col("event_type") == "add_to_cart")
+        if not carts.is_empty():
+            available_cart_share = (
+                carts.filter(pl.col("is_available") == 1).height
+                / carts.height
+            )
+            features.append(
+                f"Available-at-cart share: {available_cart_share:.1%}"
+            )
+
+        purchases = known.filter(pl.col("event_type") == "product_buy")
+        if not purchases.is_empty():
+            available_purchase_share = (
+                purchases.filter(pl.col("is_available") == 1).height
+                / purchases.height
+            )
+
+            if available_purchase_share == 1.0:
+                features.append("All observed purchases were available")
+            else:
+                features.append(
+                    f"Available-at-purchase share: "
+                    f"{available_purchase_share:.1%}"
+                )
+
+        return features
 
 class SocialFeatureExtractor(FeatureExtractorBase):
     """Extract social and competitive factors features"""
@@ -3232,6 +3317,8 @@ class AdvancedUBMGenerator:
                     self._extractors['intent'] = IntentFeatureExtractor(self)
                 if 'price_bucket' in self.events_df.columns:
                     self._extractors['price'] = PriceFeatureExtractor(self)
+                if "is_available" in self.events_df.columns:
+                    self._extractors["availability"] = AvailabilityFeatureExtractor(self)
                 if self.product_popularity is not None:
                     self._extractors['social'] = SocialFeatureExtractor(self)
                 has_name_embeddings = any(
@@ -3283,8 +3370,17 @@ class AdvancedUBMGenerator:
             if sku is not None:
                 sku_int = int(sku); text_parts.append(f" S:{sku_int}")
                 props = self.sku_properties_dict.get(sku_int, {})
-                if props.get('category') is not None: text_parts.append(f" C:{props['category']}")
-                if props.get('price') is not None: text_parts.append(f" P:{props['price']}")
+                if props.get("category") is not None:
+                    text_parts.append(f" C:{props['category']}")
+
+                is_available = event_row.get("is_available")
+                if is_available is not None:
+                    text_parts.append(
+                        f" A:{'IN' if int(is_available) == 1 else 'OUT'}"
+                    )
+
+                if props.get("price") is not None:
+                    text_parts.append(f" P:{props['price']}")
             elif url is not None: text_parts.append(f" U:{url}")
             elif query is not None: text_parts.append(f" Q:{hash(str(query))%10000:04d}") # Hash court pour Q
         except Exception: pass # Ignorer erreurs de formatage individuelles
@@ -3341,6 +3437,13 @@ class AdvancedUBMGenerator:
                 cat = props.get('category')
             if cat is not None:
                 parts.append(f"CAT:[CAT_{int(cat)}]")
+
+            is_available = event_row.get("is_available")
+            if is_available is not None:
+                availability_token = (
+                    "IN_STOCK" if int(is_available) == 1 else "OUT_OF_STOCK"
+                )
+                parts.append(f"AVAIL:[{availability_token}]")
 
             price = props.get('price')
             if price is not None:
@@ -3852,12 +3955,13 @@ class AdvancedUBMGenerator:
                 "sequence":         "SEQUENCE",
                 "social":           "SOCIAL",
                 "price":            "PRICE",
-                "intent":           "OVERVIEW",  # can be changed to its own section
+                "availability":     "AVAILABILITY",
+                "intent":           "OVERVIEW",
                 "graph":            "CUSTOM",
-                "name_embedding": "CUSTOM",
+                "name_embedding":   "CUSTOM",
                 "custom_behavior":  "CUSTOM",
-                "top_sku":       "SKU_PROPENSITY",
-                "top_category":   "CAT_PROPENSITY",
+                "top_sku":          "SKU_PROPENSITY",
+                "top_category":     "CAT_PROPENSITY",
             }
 
             for ex_name, extractor in extractors.items():
