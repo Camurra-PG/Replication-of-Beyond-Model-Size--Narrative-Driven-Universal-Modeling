@@ -455,18 +455,19 @@ def main():
 
     # Sections mises à jour avec les nouvelles
     expected_sections = [
-        "OVERVIEW", 
-        "CHURN_PROPENSITY",      # NOUVELLE
-        "TARGET_WINDOW_14D",     # NOUVELLE
-        "TEMPORAL", 
-        "SEQUENCE", 
-        "PRICE", 
-        "SOCIAL", 
-        "SKU_PROPENSITY",        # NOUVELLE  
-        "CAT_PROPENSITY",        # NOUVELLE
-        "PROP_SUBSET_STATS",     # NOUVELLE
-        "CUSTOM"
-    ]
+    "OVERVIEW",
+    "CHURN_PROPENSITY",
+    "RECENT_HISTORY_14D",
+    "TEMPORAL",
+    "SEQUENCE",
+    "AVAILABILITY",
+    "SOCIAL",
+    "GLOBAL_POPULARITY",
+    "SKU_PROPENSITY",
+    "CAT_PROPENSITY",
+    "PROP_SUBSET_STATS",
+    "CUSTOM",
+]
 
     sample_results = [r for r in all_results.values() if r.get('status') == 'success'][:5]
 
@@ -485,8 +486,21 @@ def main():
 
         # Vérifier les markers
         print("\n  Section Markers:")
-        markers = ["[PROFILE]", "[CHURN]", "[RECENT]", "[TIME]", "[SEQ]", 
-                   "[PRICE]", "[SOCIAL]", "[SKU]", "[CAT]", "[STATS]", "[MISC]", "[END]"]
+        markers = [
+            "[PROFILE]",
+            "[CHURN]",
+            "[RECENT_HISTORY]",
+            "[TIME]",
+            "[SEQ]",
+            "[AVAIL]",
+            "[SOCIAL]",
+            "[TOP]",
+            "[SKU]",
+            "[CAT]",
+            "[STATS]",
+            "[MISC]",
+            "[END]",
+        ]
         for marker in markers:
             if marker in rich_text:
                 print(f"  ✓ {marker}")
@@ -695,6 +709,9 @@ def main():
 
         print("✅ Sauvegarde terminée!")
         print(f"Fin: {datetime.now().strftime('%H:%M:%S')}")
+        print("\n✅ Retailrocket debug preprocessing finished successfully.")
+        print("Stopping before old Gemma portrait/tokenization blocks.")
+        return
     # else:
     #     print("\n✅ Aucune correction nécessaire!")
 
