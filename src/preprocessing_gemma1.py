@@ -284,7 +284,7 @@ def generate_complete_features_batch(client_batch: List[int], batch_id: int) -> 
                     section_map["RECENT_HISTORY_14D"].append(recent_txt)
                 else:
                     section_map["RECENT_HISTORY_14D"].append("No activity in last 14 days")
-                
+
                 if medium_txt != "No medium-term activity.":
                     section_map["SEQUENCE"].append(medium_txt)
                 if hist_txt != "No historical activity.":
@@ -753,9 +753,7 @@ def main():
 
         print("✅ Sauvegarde terminée!")
         print(f"Fin: {datetime.now().strftime('%H:%M:%S')}")
-        print("\n✅ Retailrocket debug preprocessing finished successfully.")
-        print("Stopping before old Gemma portrait/tokenization blocks.")
-        return
+
     # else:
     #     print("\n✅ Aucune correction nécessaire!")
 

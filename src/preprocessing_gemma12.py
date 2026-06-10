@@ -1,4 +1,4 @@
-#import unsloth
+import unsloth
 from email import parser
 import os
 import sys
@@ -16,8 +16,8 @@ import multiprocessing as mp
 from tqdm.auto import tqdm
 from collections import defaultdict
 import random
-#import gzip, zstandard as zstd
-#import transformers, re, os, textwrap
+import gzip, zstandard as zstd
+import transformers, re, os, textwrap
 import os, sys, gc, pickle, subprocess, time, argparse, logging, gzip
 from collections import defaultdict
 from pathlib import Path
@@ -424,7 +424,7 @@ def main():
         
 
     BATCH_SIZE = 1000
-    N_WORKERS = min(16, mp.cpu_count() // 2)
+    N_WORKERS = 1
 
     print(f"Configuration:")
     print(f"- Batch size: {BATCH_SIZE}")
@@ -753,9 +753,7 @@ def main():
 
         print("✅ Sauvegarde terminée!")
         print(f"Fin: {datetime.now().strftime('%H:%M:%S')}")
-        print("\n✅ Retailrocket debug preprocessing finished successfully.")
-        print("Stopping before old Gemma portrait/tokenization blocks.")
-        return
+
     # else:
     #     print("\n✅ Aucune correction nécessaire!")
 
@@ -805,7 +803,8 @@ def main():
 
     from pathlib import Path
     # ====== PARAMÈTRES PAR DÉFAUT ======
-    OUTPUT_DIR       = Path("output_features/gemma12b")
+    OUTPUT_DIR       = Path("output_features/retailrocket_gemma12b")
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     TEXTS_FILE       = OUTPUT_DIR / f"texts_for_portraits_{CURRENT_SIZE}.pkl"
     BATCH_SIZE       = 180          # nb de textes envoyés simultanément au modèle
     CHECKPOINT_EVERY = 100         # batches avant snapshot
@@ -815,7 +814,7 @@ def main():
     
     def setup_logging(run_id: str) -> None:
         log_dir = OUTPUT_DIR / "logs"
-        log_dir.mkdir(exist_ok=True)
+        log_dir.mkdir(parents=True, exist_ok=True)
         logfile = log_dir / f"main_{run_id}.log"
         logging.basicConfig(
             level=logging.INFO,
@@ -1058,7 +1057,7 @@ print(f"[GPU {gpu_id}] FIN — {len(results)} portraits")
 
     from pathlib import Path
 
-    OUTPUT_DIR      = Path("output_features/gemma12b")
+    OUTPUT_DIR       = Path("output_features/retailrocket_gemma12b")
     FEATURES_PKL    = OUTPUT_DIR / f"complete_features_{CURRENT_SIZE}_clients.pkl" 
     PORTRAITS_PKL   = OUTPUT_DIR / f"portraits_{CURRENT_SIZE}.pkl.gz" 
 
@@ -1172,7 +1171,7 @@ print(f"[GPU {gpu_id}] FIN — {len(results)} portraits")
         print(f"  → Clés: {list(example.keys())}")
         rich_text = example.get("rich_text", "")
         print(f"  → Rich text length: {len(rich_text)} chars")
-        output_file = f"output_features/gemma12b/example_client_{example_cid}.txt"
+        output_file = str(OUTPUT_DIR / f"example_client_{example_cid}.txt")
         with open(output_file, 'w') as f:
             f.write(rich_text)
         if "## PORTRAIT ##" in rich_text:
@@ -1184,7 +1183,7 @@ print(f"[GPU {gpu_id}] FIN — {len(results)} portraits")
     # CELLULE CORRECTIVE : Garantir exactement 1M clients
     # À insérer APRÈS la cellule 3 (fusion) et AVANT la cellule 4 (tokenisation)
     # ============================================
-    print("\n=== CORRECTION POUR 1M CLIENTS ===")
+    print("\n✅ Portrait fusion finished. Skipping old 1M padding block for Retailrocket.")
     print(f"Clients actuels : {len(final_data)}")
     print(f"Manquants : {1_000_000 - len(final_data)}")
 
@@ -1443,7 +1442,7 @@ print(f"[GPU {gpu_id}] FIN — {len(results)} portraits")
 
     # ---------- paramètres ----------
     BATCH_TXT  = 4096                       # taille batch texte pour le tokenizer
-    N_WORKERS  = min(os.cpu_count() or 8, 16)  # threads CPU
+    N_WORKERS  = 1  # threads CPU
     MAX_LEN    = MAX_TOKENS
 
     print(f"  → Batch textes      : {BATCH_TXT}")
