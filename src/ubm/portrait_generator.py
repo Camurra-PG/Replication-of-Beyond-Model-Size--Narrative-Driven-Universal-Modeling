@@ -23,8 +23,8 @@ logging.basicConfig(
 MODEL_NAME = "unsloth/gemma-3-1b-it-unsloth-bnb-4bit"
 #MODEL_NAME = "google/gemma-3-1b-it"
 CTX_LIMIT = 3048
-MAX_PROMPT_TOKENS = int(os.getenv("PORTRAIT_MAX_PROMPT_TOKENS", "1000"))  # Réduit de 512 pour éviter OOM
-GEN_TOKENS = 128
+MAX_PROMPT_TOKENS = int(os.getenv("PORTRAIT_MAX_PROMPT_TOKENS", "1800"))  # Réduit de 512 pour éviter OOM
+GEN_TOKENS = 192
 BATCH_SIZE = int(os.getenv("PORTRAIT_BATCH", "180")) 
 HF_TOKEN = os.getenv("HF_TOKEN")
 if not HF_TOKEN:
@@ -74,6 +74,9 @@ representation in recommender-system modelling.
 - Mention important SKU/category affinities or global-popularity overlap when present.
 - Do not output code, markdown headings, code fences, or explanations.
 - Terminate with "— FIN —".
+- Never answer that the behavioural signal is too sparse if the client has at least one observed event.
+- For sparse browsing-only users, still produce 3 to 5 bullets based on observed page visits, recency, categories, SKU exposure, availability, popularity overlap, and churn/return likelihood.
+- If there are no purchases or add-to-cart events, explicitly describe the user as browsing-only rather than saying the signal is unusable.
 
 — FIN —
 """)
@@ -145,15 +148,6 @@ class PortraitGenerator:
                 flags=re.DOTALL,
             )
     
-        rt = re.sub(
-            r"\[RECENT_HISTORY\]\s*"
-            r"##\s*RECENT_HISTORY_14D\s*##.*?"
-            r"(?=\n\[[A-Z_]+\]\n|\n\[END\]|\Z)",
-            "",
-            rt,
-            flags=re.DOTALL,
-        )
-    
         rt = rt.replace("[END]", "").strip()
     
         if len(rt) > 8000:
@@ -165,7 +159,7 @@ class PortraitGenerator:
         """Encode un batch de conversations"""
         conv_strings, cids = [], []
         for cid, rich in items:
-            profile_txt = self._strip_rich_text(rich, keep_raw=False)
+            profile_txt = self._strip_rich_text(rich, keep_raw=True)
     
             token_ids = self.base_tok.encode(profile_txt, add_special_tokens=False)[:MAX_PROMPT_TOKENS]
             profile_txt = self.base_tok.decode(token_ids, skip_special_tokens=True)
@@ -212,7 +206,15 @@ class PortraitGenerator:
         ]
         
         if not bullets:
-            bullets = ["- Behavioural signal too sparse to summarise."]
+            cleaned = re.sub(r"\s+", " ", text).strip()
+            if cleaned and cleaned != "— FIN —":
+                bullets = [f"- {cleaned[:240]}"]
+            else:
+                bullets = [
+                    "- Sparse browsing-only profile with limited explicit conversion signal.",
+                    "- Behaviour is mainly represented through observed page visits, category/SKU exposure, recency, and availability interactions.",
+                    "- No reliable purchase, price, demographic, or search-intent conclusions should be inferred."
+                ]
         
         return "\n".join(bullets) + "\n— FIN —"
 
