@@ -15,3 +15,4 @@ unsloth
 networkit
 sentence-transformers
 huggingface_hub
+kaggle

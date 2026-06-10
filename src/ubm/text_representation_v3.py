@@ -1,60 +1,42 @@
-# ubm/text_representation_v3.py
-
 from __future__ import annotations
-import unsloth
-import os, multiprocessing
-import os; os.environ["SKIP_URL_GRAPH"] = "1"
-# 1) On détecte automatiquement  le nombre de vCPU (sur a2-highgpu-1g → 12)
+
+import gc
+import json
+import logging
+import math
+import multiprocessing
+import os
+import pickle
+import random
+import re
+from collections import Counter, defaultdict
+from datetime import datetime, timedelta
+from itertools import combinations
+from math import log2
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+
+import networkit as nk
+import numpy as np
+import polars as pl
+from scipy.stats import entropy
+
+
+# ---------------------------------------------------------------------------
+# Runtime configuration
+# ---------------------------------------------------------------------------
 n_threads = multiprocessing.cpu_count()
 print(f"n_threads:{n_threads}")
-# For BLAS / OpenMP back-ends
-os.environ["OPENBLAS_NUM_THREADS"]  = "4"
-os.environ["MKL_NUM_THREADS"]       = "4"
-os.environ["NUMEXPR_MAX_THREADS"]   = "4"
-os.environ["OMP_NUM_THREADS"]       = "4"
-os.environ["POLARS_MAX_THREADS"]    = "4"
-import unsloth
-# NetworKit – needs an explicit call
-import networkit as nk
+
+os.environ["OPENBLAS_NUM_THREADS"] = "4"
+os.environ["MKL_NUM_THREADS"] = "4"
+os.environ["NUMEXPR_MAX_THREADS"] = "4"
+os.environ["OMP_NUM_THREADS"] = "4"
+os.environ["POLARS_MAX_THREADS"] = "4"
+
 nk.setNumberOfThreads(4)
-import pyarrow.parquet as pq  
-import math             #  ← NEW
-import statistics        #  ← NEW
-import torch
-import torch.nn.functional as F
-import numpy as np
-import pandas as pd
-import re
-import time
-import scipy.sparse as sp
-import pickle
-import json
-from datetime import datetime, timedelta
-from typing import Dict, List, Tuple, Set, Optional, Union, Any
-import logging
-from scipy.stats import entropy
-from collections import Counter, defaultdict
-import os
-from tqdm import tqdm
-from pathlib import Path
-import gc
-import random
-from datetime import datetime, timedelta
-from typing import Dict, List, Any, Optional, Union
-import polars as pl
-import json, pickle, gc, os, logging, networkx as nx
-from collections import Counter, defaultdict
-from pathlib import Path
-from tqdm import tqdm
-from itertools import combinations          # <-- IMPORT supplémentaire en haut de fichier
-from sklearn.cluster import MiniBatchKMeans
-from collections import Counter
-from math import log2
-import networkit as nk
-from networkit import embedding as nk_embed      # NetworKit’s fast Node2Vec
-from .portrait_generator import PortraitGenerator, generate_portraits
+
 print("Polars pool size:", pl.threadpool_size())
-from math import isfinite
 pl.enable_string_cache()
 # --- Setup Logging ---
 logger = logging.getLogger(__name__)
@@ -66,42 +48,38 @@ if not logger.hasHandlers():
 # ---------------------------------------------------------------------------
 MAX_RICH_TOKENS          : int = 4096  # set to 2048 if you want shorter texts
 TOP_FEATURES_PER_SECTION : int = 10    # soft‑cap per section before trimming
-IMPLICIT_WEIGHT_REPEAT   : int = 2     # repeat high‑weight tokens N times
+TOP_RETAILROCKET_SKUS: int = 100
+TOP_RETAILROCKET_CATEGORIES: int = 100
 SECTIONS_ORDER: List[str] = [
-    "OVERVIEW",           # Garde en premier pour le contexte
-    "CHURN_PROPENSITY",   # NOUVEAU: Signaux critiques pour la tâche
-    "TARGET_WINDOW_14D",  # Activité récente (important pour churn)
-    "TEMPORAL",           # Patterns temporels
-    "SEQUENCE",           # Séquences comportementales
-    "PRICE",              # Sensibilité prix
-    "SOCIAL",             # Facteurs sociaux
-    "SKU_PROPENSITY",  
-    "CAT_PROPENSITY",  
+    "OVERVIEW",
+    "CHURN_PROPENSITY",
+    "RECENT_HISTORY_14D",
+    "TEMPORAL",
+    "SEQUENCE",
+    "AVAILABILITY",
+    "SOCIAL",
+    "GLOBAL_POPULARITY",
+    "SKU_PROPENSITY",
+    "CAT_PROPENSITY",
     "PROP_SUBSET_STATS",
     "CUSTOM",
 ]
 
-# Ajouter ces constantes après SECTIONS_ORDER
 SECTION_MARKERS = {
     "OVERVIEW": "[PROFILE]",
     "CHURN_PROPENSITY": "[CHURN]",
-    "TARGET_WINDOW_14D": "[RECENT]",
+    "RECENT_HISTORY_14D": "[RECENT_HISTORY]",
     "TEMPORAL": "[TIME]",
     "SEQUENCE": "[SEQ]",
-    "PRICE": "[PRICE]",
+    "AVAILABILITY": "[AVAIL]",
     "SOCIAL": "[SOCIAL]",
+    "GLOBAL_POPULARITY": "[TOP]",
     "SKU_PROPENSITY": "[SKU]",
     "CAT_PROPENSITY": "[CAT]",
     "PROP_SUBSET_STATS": "[STATS]",
-    "CUSTOM": "[MISC]"
+    "CUSTOM": "[MISC]",
 }
 
-
-# ─── HOT-URL & HOT-SKU FILTER THRESHOLDS ────────────────────────────────────
-# only keep URLs seen at least this many times when building the bipartite graph
-# only keep SKUs with popularity score ≥ this when building the bipartite graph
-URL_FREQ_THRESHOLD = 21
-SKU_POP_THRESHOLD  = 45
 # ---------------------------------------------------------------------------
 #                          UTILITY HELPERS                                   #
 # ---------------------------------------------------------------------------
@@ -117,74 +95,11 @@ class FeatureExtractorBase:
     def extract_features(self, client_id: int, events: pl.DataFrame, now: datetime) -> List[str]:
         """Extract features for a client - must be implemented by subclasses"""
         raise NotImplementedError("Subclasses must implement extract_features")
-# -------------------------------------------------------------
-class TopCategoryFeatureExtractor(FeatureExtractorBase):
-    """Met en avant les 100 catégories demandées par la task propensity_category."""
-
-    def __init__(self, parent):
-        super().__init__(parent)
-        self.top_cats = parent.top_categories     # list[int]
-
-    def extract_features(self, client_id: int, events: pl.DataFrame, now: datetime) -> List[str]:
-        if not self.top_cats:
-            return ["Top-category list unavailable"]
-        cat_ev = events.filter(
-            pl.col('category_id').is_in(self.top_cats) &
-            pl.col('event_type').is_in(['product_buy', 'add_to_cart', 'page_visit'])
-        )
-        if cat_ev.is_empty():
-            return ["No top-category interactions"]
-
-        rec_w = (
-            (pl.lit(now) - cat_ev['timestamp']).dt.total_seconds() / 86400 + 1
-        ).pow(-0.5)
-        cat_ev = cat_ev.with_columns(rec_w.alias('rw'))
-
-        scores = (
-            cat_ev.group_by('category_id')
-                  .agg([
-                      pl.len().alias('cnt'),
-                      pl.sum('rw').alias('rScore'),
-                      pl.max('timestamp').alias('last_ts')
-                  ])
-                  .sort('rScore', descending=True)
-        )
-
-        feats = []
-        for i, row in enumerate(scores.head(5).iter_rows(named=True), 1):
-            delta = (now - row['last_ts']).days
-            feats.append(f"TOPCAT{i}:CAT_{row['category_id']} rs={row['rScore']:.2f} "
-                         f"cnt={row['cnt']} last={delta}d")
-
-        cov = scores.height / len(self.top_cats)
-        feats.append(f"Top-category coverage:{cov:.0%}")
-        return feats
-
-
-
-def compute_sparse_pagerank(src: np.ndarray,
-                            dst: np.ndarray,
-                            weights: np.ndarray,
-                            alpha: float = 0.85,
-                            tol: float = 1e-6,
-                            max_iter: int = 1000) -> dict[int, float]:
-    """
-    Parallel PageRank using NetworKit.  ~10-20× faster than NetworkX
-    on million-edge graphs.
-    """
-    g, id2orig = _nk_graph_from_edges(src, dst, weights, directed=True)
-    pr = nk.centrality.PageRank(
-        g, damp=alpha, tol=tol, maxIterations=max_iter, normalized=False
-    )
-    pr.run()
-    scores = pr.scores()          # list[float] aligned with 0…n-1 ids
-    return {int(id2orig[i]): s for i, s in enumerate(scores)}
 
 # ------------------------------------------------------------------
 # NetworKit helpers
 # ------------------------------------------------------------------
 # --- BEGIN PATCH: helpers -----------------------------------------------------
-import numpy as np
 
 def _nk_graph_from_edges(src: np.ndarray,
                          dst: np.ndarray,
@@ -224,54 +139,6 @@ def compute_sparse_pagerank(src: np.ndarray,
     scores = pr.scores()                       # list[float] aligned with 0…n-1 ids
     return {int(id2orig[i]): s for i, s in enumerate(scores)}
 
-
-
-def _shannon_entropy(counter: Counter) -> float:
-    """Shannon entropy in bits from a Counter of counts."""
-    n = sum(counter.values())
-    if n == 0:
-        return 0.0
-    return -sum((c / n) * log2(c / n) for c in counter.values())
-
-def _approx_token_len(text: str) -> int:
-    """Very cheap proxy for token count (≈ whitespace split)."""
-    return len(text.split())
-
-
-def _truncate_to_max_tokens(lines: List[str], limit: int) -> List[str]:
-    """Greedy keep‑from‑start strategy (safer for ordered / weighted chunks)."""
-    kept: List[str] = []
-    for ln in lines:
-        if _approx_token_len("\n".join(kept + [ln])) > limit:
-            break
-        kept.append(ln)
-    return kept
-
-
-def _top_k_features(features: List[str], k: int) -> Tuple[List[str], List[str]]:
-    """Return `(top_k, overflow)` lists – *overflow* can be shuffled/dropped."""
-    if len(features) <= k:
-        return features, []
-    return features[:k], features[k:]
-
-
-def _repeat_for_weight(lines: List[str], repeat: int) -> List[str]:
-    """Naïve implicit weight: duplicate *every* line *repeat* times."""
-    if repeat <= 1:
-        return lines
-    out: List[str] = []
-    for ln in lines:
-        out.extend([ln] * repeat)
-    return out
-def bucketize_days(delta_days: int) -> str:
-    if delta_days <= 3:
-        return "R_0-3d"
-    if delta_days <= 7:
-        return "R_3-7d"
-    if delta_days <= 30:
-        return "R_7-30d"
-    return "R_30+d"
-
 POP_QUANT_EDGES: list = []   # global mutable (sera rempli une fois)
 
 def pop_bin(score: float) -> str:
@@ -290,89 +157,91 @@ def pop_bin(score: float) -> str:
 def _build_rich_text(
     section_map: dict[str, list[str]],
     max_tokens: int = 3500,
-    implicit_repeat: int = 2,
     top_per_section: int = 10,
     shuffle_seed: int | None = None,
-    use_markers: bool = True,  # NOUVEAU paramètre
+    use_markers: bool = True,
 ) -> str:
     """
-    Version optimisée avec markers et déduplication améliorée
-    """
-    import random
-    import itertools
-    from collections import OrderedDict
+    Build the final readable user-profile representation.
 
+    Features are deduplicated and rendered only once. The previous implicit
+    weighting through identical repeated text lines is intentionally disabled
+    for the Retailrocket profile format, because it inflated the profile
+    without adding interpretable information.
+    """
     rnd = random.Random(shuffle_seed)
-    
-    # Déduplication globale des features
-    seen_features = set()
-    deduped_sections = {}
-    
+
+    # ------------------------------------------------------------
+    # Deduplicate identical feature lines globally while preserving
+    # the original first-occurrence order.
+    # ------------------------------------------------------------
+    seen_features: set[str] = set()
+    deduped_sections: dict[str, list[str]] = {}
+
     for section, items in section_map.items():
-        deduped_items = []
+        deduped_items: list[str] = []
+
         for item in items:
-            # Normaliser pour la déduplication
             normalized = item.strip().lower()
+
             if normalized not in seen_features:
                 seen_features.add(normalized)
                 deduped_items.append(item)
+
         deduped_sections[section] = deduped_items
 
     def _truncate(tokens: list[str], limit: int) -> list[str]:
         total = 0
-        out = []
-        for tok in tokens:
-            total += len(tok.split())
+        output: list[str] = []
+
+        for token in tokens:
+            total += len(token.split())
+
             if total > limit:
                 break
-            out.append(tok)
-        return out
+
+            output.append(token)
+
+        return output
+
+    # Ranking-oriented sections should keep their deterministic order.
+    ordered_sections = {
+        "GLOBAL_POPULARITY",
+        "SKU_PROPENSITY",
+        "CAT_PROPENSITY",
+    }
 
     lines: list[str] = []
 
     for section in SECTIONS_ORDER:
         items = deduped_sections.get(section, [])
+
         if not items:
             continue
 
-        # 1. Limiter au top K
-        items = items[:top_per_section]
+        rendered_items = items[:top_per_section]
 
-        # 2. Répétition implicite pour les items importants
-        repeated = []
-        for item in items:
-            # Les features de churn/propensity sont toujours répétées
-            if "CHURN_" in item or "PROPENSITY" in item or "**" in item:
-                repeated.extend([item] * implicit_repeat)
-            else:
-                repeated.append(item)
+        # Preserve ranked features exactly as generated.
+        # Other narrative feature sections may still be shuffled after the
+        # first two items, as in the existing profile-generation design.
+        if len(rendered_items) > 3 and section not in ordered_sections:
+            first_items = rendered_items[:2]
+            remaining_items = rendered_items[2:]
+            rnd.shuffle(remaining_items)
+            rendered_items = first_items + remaining_items
 
-        # 3. Shuffle léger pour la variété (sauf les premières)
-        if len(repeated) > 3:
-            first_items = repeated[:2]  # Garde les 2 premiers
-            rest_items = repeated[2:]
-            rnd.shuffle(rest_items)
-            repeated = first_items + rest_items
-
-        # 4. Ajouter le marqueur de section et le contenu
         if use_markers and section in SECTION_MARKERS:
-            lines.append(f"{SECTION_MARKERS[section]}")
-        lines.append(f"## {section} ##")
-        lines.extend(repeated)
+            lines.append(SECTION_MARKERS[section])
 
-    # 5. Coupe globale au nombre de tokens demandé
+        lines.append(f"## {section} ##")
+        lines.extend(rendered_items)
+
     lines = _truncate(lines, max_tokens)
 
-    # 6. Ajouter un marqueur de fin
     if use_markers:
         lines.append("[END]")
 
     return "\n".join(lines)
-
-
-
-
-
 
 class TemporalFeatureExtractor(FeatureExtractorBase):
     """Extract temporal patterns from user behavior, enhanced with recency and inactivity."""
@@ -708,31 +577,84 @@ class SequenceFeatureExtractor(FeatureExtractorBase):
             self.logger.debug(f"Error extracting event sequences: {e}")
             features.append("Error extracting event sequences")
 
-    def _extract_purchase_funnel(self, events: pl.DataFrame, features: List[str]) -> None:
+    def _extract_purchase_funnel(
+        self,
+        events: pl.DataFrame,
+        features: List[str],
+    ) -> None:
+        """
+        Summarize observed Retailrocket funnel events.
+
+        Retailrocket contains product views, cart additions and transactions,
+        but no search-query events. Ratios are descriptive event ratios and
+        should not be interpreted as a fully observed conversion path.
+        """
         try:
-            tmp = events.group_by('event_type').agg(pl.count().alias('count'))
-            event_counts = {row['event_type']: row['count'] for row in tmp.iter_rows(named=True)}
-            views = event_counts.get('page_visit', 0); searches = event_counts.get('search_query', 0)
-            cart_adds = event_counts.get('add_to_cart', 0); purchases = event_counts.get('product_buy', 0)
-            if views == 0 and searches == 0 and cart_adds == 0 and purchases == 0: return
+            tmp = (
+                events.group_by("event_type")
+                .agg(pl.len().alias("count"))
+            )
 
-            funnel_stages = ["Purchase funnel analysis:"]
-            total_starts = views + searches
-            if total_starts > 0: funnel_stages.append(f"  Starts (View/Search): {total_starts}")
+            event_counts = {
+                row["event_type"]: row["count"]
+                for row in tmp.iter_rows(named=True)
+            }
+
+            views = event_counts.get("page_visit", 0)
+            cart_adds = event_counts.get("add_to_cart", 0)
+            purchases = event_counts.get("product_buy", 0)
+
+            if views == 0 and cart_adds == 0 and purchases == 0:
+                return
+
+            funnel_stages = ["All-profile-history funnel events:"]
+
+            if views > 0:
+                funnel_stages.append(f"  Product Views: {views}")
+
             if cart_adds > 0:
-                cart_rate = (cart_adds / total_starts) * 100 if total_starts > 0 else 0
-                funnel_stages.append(f"  Cart Adds: {cart_adds} ({cart_rate:.1f}% of starts)")
-                if purchases > 0:
-                    purchase_rate_from_cart = (purchases / cart_adds) * 100
-                    funnel_stages.append(f"  Purchases: {purchases} ({purchase_rate_from_cart:.1f}% of cart adds)")
-                    purchase_rate_from_start = (purchases / total_starts) * 100 if total_starts > 0 else 0
-                    funnel_stages.append(f"  Overall Conversion: {purchase_rate_from_start:.2f}% from start")
-            elif purchases > 0:
-                funnel_stages.append(f"  Purchases: {purchases} (direct or uncaptured cart add)")
+                if views > 0:
+                    cart_view_ratio = (cart_adds / views) * 100
+                    funnel_stages.append(
+                        f"  Cart Adds: {cart_adds} "
+                        f"({cart_view_ratio:.1f}% relative to views)"
+                    )
+                else:
+                    funnel_stages.append(
+                        f"  Cart Adds: {cart_adds} "
+                        f"(no preceding view observed)"
+                    )
 
-            if len(funnel_stages) > 1: features.extend(funnel_stages)
-        except Exception as e:
-            self.logger.debug(f"Error extracting purchase funnel: {e}")
+            if purchases > 0:
+                if cart_adds > 0 and purchases <= cart_adds:
+                    purchase_cart_ratio = (purchases / cart_adds) * 100
+                    funnel_stages.append(
+                        f"  Purchases: {purchases} "
+                        f"({purchase_cart_ratio:.1f}% relative to cart adds)"
+                    )
+                elif cart_adds > 0:
+                    funnel_stages.append(
+                        f"  Purchases: {purchases} "
+                        f"(includes purchases without observed cart add)"
+                    )
+                else:
+                    funnel_stages.append(
+                        f"  Purchases: {purchases} "
+                        f"(no preceding cart add observed)"
+                    )
+
+                if views > 0:
+                    purchase_view_ratio = (purchases / views) * 100
+                    funnel_stages.append(
+                        f"  Purchase/View Event Ratio: "
+                        f"{purchase_view_ratio:.2f}%"
+                    )
+
+            if len(funnel_stages) > 1:
+                features.append("\n".join(funnel_stages))
+
+        except Exception as exc:
+            self.logger.debug(f"Error extracting purchase funnel: {exc}")
             features.append("Error extracting purchase funnel")
 
     def _extract_Browse_sequences(self, events: pl.DataFrame, features: List[str]) -> None:
@@ -840,11 +762,25 @@ class GraphFeatureExtractor(FeatureExtractorBase):
                 features.append(f"Dominant cat (PR): CAT_{top_cat} ({scores[top_idx]:.3f})")
 
             # ------------------------------------------------------------------
-            # 3) Average clustering coefficient (undirected view)
-            lu = nk.clustering.LocalClusteringCoefficient(g.toUndirected(), weighted=True)
-            lu.run()
-            avg_clust = sum(lu.scores()) / g.numberOfNodes()
-            features.append(f"Avg cat clustering: {avg_clust:.3f}")
+            # 3) Average clustering coefficient, where supported by NetworKit.
+            # Some local NetworKit versions do not expose nk.clustering.
+            try:
+                if hasattr(nk, "clustering") and hasattr(
+                    nk.clustering, "LocalClusteringCoefficient"
+                ):
+                    lu = nk.clustering.LocalClusteringCoefficient(
+                        g.toUndirected(), weighted=True
+                    )
+                    lu.run()
+                    avg_clust = sum(lu.scores()) / g.numberOfNodes()
+                    features.append(f"Avg cat clustering: {avg_clust:.3f}")
+            except Exception as exc:
+                self.logger.debug(
+                    f"Category clustering coefficient skipped: {exc}"
+                )
+
+            # ------------------------------------------------------------------
+            # 4) Top transition (weight ≥ 2)
 
             # ------------------------------------------------------------------
             # 4) Top transition (weight ≥ 2)
@@ -898,7 +834,6 @@ class GraphFeatureExtractor(FeatureExtractorBase):
             )
             sess_id = gaps_min.gt(sess_gap).cum_sum()  # fast cumulative ids
             rel_evt = rel_evt.with_columns(pl.Series('sid', sess_id))
-            rel_evt = rel_evt.filter(pl.col('sku').is_in(self.parent.top_skus))
 
             # 2) count SKU co-occurrences inside each session
             from itertools import combinations
@@ -953,37 +888,32 @@ class GraphFeatureExtractor(FeatureExtractorBase):
 class IntentFeatureExtractor(FeatureExtractorBase):
     """Extract search intent and interest patterns, with simple cart abandon signal."""
 
-    def extract_features(self, client_id: int, events: pl.DataFrame, now: datetime) -> List[str]:
-        features = []
-        if events.height == 0: return ["No activity data for intent analysis"]
-        try:
-            self._extract_search_intent(events, features)
-            self._extract_Browse_intent(events, features)
-            self._extract_funnel_position(events, features, now) # Passer now
-            self._extract_cart_abandon_signal(events, features) # Nouvelle méthode simple
-        except Exception as e:
-            self.logger.error(f"Error extracting intent features for client {client_id}: {e}", exc_info=self.parent.debug_mode)
-            features.append("Error during intent feature extraction.")
-        return features
+    def extract_features(
+        self,
+        client_id: int,
+        events: pl.DataFrame,
+        now: datetime,
+    ) -> List[str]:
+        features: List[str] = []
 
-    def _extract_search_intent(self, events: pl.DataFrame, features: List[str]) -> None:
+        if events.height == 0:
+            return ["No activity data for intent analysis"]
+
         try:
-            search_events = events.filter(pl.col('event_type') == pl.lit('search_query', dtype=pl.Categorical))
-            if search_events.height == 0: features.append("No search events."); return
-            features.append(f"Total searches: {search_events.height}")
-            if 'query' in search_events.columns:
-                query_hashes = search_events.filter(pl.col('query').is_not_null()).select(pl.col('query').hash().alias('query_hash'))['query_hash']
-                if query_hashes.len() > 0:
-                    unique_hashes_count = query_hashes.n_unique()
-                    features.append(f"Unique search hashes: {unique_hashes_count}")
-                    if unique_hashes_count < query_hashes.len():
-                        top_hash_info = query_hashes.value_counts().sort(by="count", descending=True).head(1)
-                        if top_hash_info.height > 0:
-                            top_hash, top_count = top_hash_info.row(0)
-                            features.append(f"Top search hash: [QUERY_{top_hash}] ({top_count}x)")
-                else: features.append("No valid search queries found.")
-            else: features.append("Query column missing.")
-        except Exception as e: self.logger.debug(f"Err search intent: {e}"); features.append("Err search intent.")
+            # Retailrocket contains views, cart additions and transactions,
+            # but no search-query events.
+            self._extract_Browse_intent(events, features)
+            self._extract_funnel_position(events, features, now)
+            self._extract_cart_abandon_signal(events, features)
+
+        except Exception as exc:
+            self.logger.error(
+                f"Error extracting intent features for client {client_id}: {exc}",
+                exc_info=self.parent.debug_mode,
+            )
+            features.append("Error during intent feature extraction.")
+
+        return features
 
     def _extract_Browse_intent(self, events: pl.DataFrame, features: List[str]) -> None:
         # Initialize cat_counts and total_cat_visits to default values
@@ -1063,24 +993,20 @@ class IntentFeatureExtractor(FeatureExtractorBase):
         try:
             tmp = events.group_by('event_type').agg(pl.col('event_type').count().alias('count'))  # Changer pl.count() en pl.col().count()
             event_counts = {row['event_type']: row['count'] for row in tmp.iter_rows(named=True)}
-            views = event_counts.get('page_visit', 0); searches = event_counts.get('search_query', 0)
-            cart_adds = event_counts.get('add_to_cart', 0); purchases = event_counts.get('product_buy', 0)
+            views = event_counts.get("page_visit", 0)
+            cart_adds = event_counts.get("add_to_cart", 0)
+            purchases = event_counts.get("product_buy", 0)
 
-            if purchases > 0: features.append("Funnel Stage: Conversion")
-            elif cart_adds > 0: features.append("Funnel Stage: Consideration")
-            elif searches > 0 or views > 5: features.append("Funnel Stage: Research")
-            elif views > 0: features.append("Funnel Stage: Awareness")
-            else: features.append("Funnel Stage: Inactive")
-
-            # Last action type already handled by TemporalExtractor recency
-            # last_event = events.sort("timestamp", descending=True).row(0, named=True)
-            # if last_event:
-            #     last_type = last_event['event_type']; last_time = last_event['timestamp']
-            #     days_since_last = (now - last_time).days if last_time else -1
-            #     recency_tag = f"(last {days_since_last+1}d)" if days_since_last < 30 and days_since_last >=0 else "(>30d ago)" if days_since_last >=0 else ""
-            #     # Mapping simple
-            #     action_map = {'product_buy':'Purchase', 'add_to_cart':'Cart Add', 'search_query':'Search', 'page_visit':'Visit', 'remove_from_cart':'Cart Remove'}
-            #     features.append(f"Last action type: {action_map.get(last_type, last_type)} {recency_tag}")
+            if purchases > 0:
+                features.append("Funnel Stage: Conversion")
+            elif cart_adds > 0:
+                features.append("Funnel Stage: Consideration")
+            elif views > 5:
+                features.append("Funnel Stage: Browsing")
+            elif views > 0:
+                features.append("Funnel Stage: Awareness")
+            else:
+                features.append("Funnel Stage: Inactive")
 
         except Exception as e: self.logger.debug(f"Err funnel pos: {e}"); features.append("Err funnel position.")
 
@@ -1110,93 +1036,91 @@ class IntentFeatureExtractor(FeatureExtractorBase):
             return int(num_sessions)
         except Exception as e: self.logger.error(f"Err counting sessions: {e}"); return 1
 
+class AvailabilityFeatureExtractor(FeatureExtractorBase):
+    """Extract stock-availability interaction patterns from Retailrocket."""
 
-class PriceFeatureExtractor(FeatureExtractorBase):
-    """Extract price sensitivity and purchase behavior features"""
-    # --- Code inchangé ---
-    # (Ajouter 'now' comme argument non utilisé)
-    def extract_features(self, client_id: int, events: pl.DataFrame, now: datetime) -> List[str]:
-        if 'price_bucket' not in events.columns: return ["Price features skipped."]
-        features = []
-        try:
-            events_with_price = events.filter(pl.col('price_bucket').is_not_null())
-            if events_with_price.height == 0: return ["No price data."]
-            self._extract_price_range(events_with_price, features)
-            self._extract_price_sensitivity(client_id, events_with_price, features)
-            has_discount_cols = any(c in events.columns for c in ['discount', 'discount_percentage', 'original_price'])
-            if has_discount_cols: self._extract_discount_patterns(events_with_price, features)
-            # else: features.append("Discount patterns skipped.") # Optionnel
-        except Exception as e: self.logger.error(f"Err price client {client_id}: {e}"); features.append("Err price")
-        # --- RFM quick tag ---
-        purchases = events_with_price.filter(pl.col('event_type') == 'product_buy')
-        if purchases.height:
-            rec = (now - purchases['timestamp'].max()).days               # Recency
-            freq = purchases.filter(pl.col('timestamp') >= now - timedelta(days=90)).height
-            mon = purchases['price_bucket'].mean()                        # Monetary (moyenne des buckets)
-            features.append(f"RFM:{rec}:{freq}:{mon:.0f}")
-               
+    def extract_features(
+        self,
+        client_id: int,
+        events: pl.DataFrame,
+        now: datetime,
+    ) -> List[str]:
+        if "is_available" not in events.columns:
+            return []
+
+        product_events = events.filter(
+            pl.col("event_type").is_in(
+                ["page_visit", "add_to_cart", "product_buy"]
+            )
+            & pl.col("sku").is_not_null()
+        )
+
+        if product_events.is_empty():
+            return []
+
+        known = product_events.filter(
+            pl.col("is_available").is_not_null()
+        )
+
+        if known.is_empty():
+            return ["Availability status unavailable for interactions"]
+
+        features: List[str] = []
+
+        coverage = known.height / product_events.height
+        features.append(
+            f"Availability known for {coverage:.1%} of interactions"
+        )
+
+        available_share = (
+            known.filter(pl.col("is_available") == 1).height / known.height
+        )
+
+        if available_share >= 0.80:
+            features.append("Mostly interacted with available products")
+        elif available_share <= 0.40:
+            features.append("Frequent interaction with unavailable products")
+        else:
+            features.append("Mixed available and unavailable product interactions")
+
+        views = known.filter(pl.col("event_type") == "page_visit")
+        if not views.is_empty():
+            unavailable_views = views.filter(
+                pl.col("is_available") == 0
+            ).height
+
+            if unavailable_views > 0:
+                unavailable_view_share = unavailable_views / views.height
+                features.append(
+                    f"Unavailable product views: {unavailable_view_share:.1%}"
+                )
+
+        carts = known.filter(pl.col("event_type") == "add_to_cart")
+        if not carts.is_empty():
+            available_cart_share = (
+                carts.filter(pl.col("is_available") == 1).height
+                / carts.height
+            )
+            features.append(
+                f"Available-at-cart share: {available_cart_share:.1%}"
+            )
+
+        purchases = known.filter(pl.col("event_type") == "product_buy")
+        if not purchases.is_empty():
+            available_purchase_share = (
+                purchases.filter(pl.col("is_available") == 1).height
+                / purchases.height
+            )
+
+            if available_purchase_share == 1.0:
+                features.append("All observed purchases were available")
+            else:
+                features.append(
+                    f"Available-at-purchase share: "
+                    f"{available_purchase_share:.1%}"
+                )
+
         return features
-
-    def _extract_price_range(self, events: pl.DataFrame, features: List[str]) -> None:
-        try:
-            relevant_events = events.filter( pl.col('event_type').is_in(['page_visit', 'add_to_cart', 'product_buy']) )
-            if relevant_events.height == 0: return
-            price_stats = relevant_events.select(pl.col('price_bucket')).describe() # Utiliser 'price_bucket'
-            stats_dict = {row[0]: row[1] for row in price_stats.iter_rows()}
-            min_price = stats_dict.get('min'); max_price = stats_dict.get('max')
-            avg_price = stats_dict.get('mean'); std_price = stats_dict.get('std')
-            count = stats_dict.get('count')
-            if count is not None and count >= 2:
-                if min_price is not None and max_price is not None:
-                     features.append(f"Interacted price range (bucket): {min_price:.0f} - {max_price:.0f} (avg {avg_price:.0f})")
-                     price_range = max_price - min_price
-                     if price_range > 30: features.append("Wide price exploration.")
-                     elif price_range < 10: features.append("Narrow price focus.")
-                purchase_prices = relevant_events.filter(pl.col('event_type') == pl.lit('product_buy', dtype=pl.Categorical))['price_bucket']
-                if purchase_prices.len() >= 2:
-                    avg_purchase = purchase_prices.mean(); std_purchase = purchase_prices.std()
-                    if avg_purchase is not None and avg_purchase > 0 and std_purchase is not None:
-                         cv = std_purchase / avg_purchase
-                         if cv < 0.15: features.append("Consistent purchase price.")
-                         elif cv > 0.4: features.append("Varied purchase prices.")
-        except Exception as e: self.logger.debug(f"Err price range: {e}"); features.append("Err price range.")
-
-    def _extract_price_sensitivity(self, client_id: int, events: pl.DataFrame, features: List[str]) -> None:
-        try:
-            price_col = 'price_bucket'
-            cart_events = events.filter(pl.col('event_type') == pl.lit('add_to_cart', dtype=pl.Categorical))
-            purchase_events = events.filter(pl.col('event_type') == pl.lit('product_buy', dtype=pl.Categorical))
-            if cart_events.height > 0 and purchase_events.height > 0:
-                avg_cart_price = cart_events[price_col].mean()
-                avg_purchase_price = purchase_events[price_col].mean()
-                if avg_cart_price is not None and avg_purchase_price is not None and avg_cart_price > 0:
-                    ratio = avg_purchase_price / avg_cart_price
-                    if ratio < 0.8: features.append("Sensitivity: High (buys cheaper than adds)")
-                    elif ratio > 1.2: features.append("Sensitivity: Low (buys similar/pricier)")
-                    else: features.append("Sensitivity: Moderate")
-
-            # Abandon vs price logic
-            if cart_events.height > 0 and 'sku' in events.columns:
-                cart_skus_prices = cart_events.select(['sku', price_col]).drop_nulls()
-                if cart_skus_prices.height > 0:
-                     purchased_skus = purchase_events.select('sku').drop_nulls()['sku'].unique().to_list()
-                     if purchased_skus:
-                          abandoned_items = cart_skus_prices.filter(~pl.col('sku').is_in(purchased_skus))
-                          purchased_carted_items = cart_skus_prices.filter(pl.col('sku').is_in(purchased_skus))
-                          if abandoned_items.height > 0 and purchased_carted_items.height > 0:
-                               avg_abandoned_price = abandoned_items[price_col].mean()
-                               avg_purchased_price = purchased_carted_items[price_col].mean()
-                               if avg_abandoned_price is not None and avg_purchased_price is not None:
-                                    if avg_abandoned_price > avg_purchased_price * 1.2:
-                                         features.append("Tends to abandon higher-priced cart items.")
-        except Exception as e: self.logger.error(f"Err price sensitivity client {client_id}: {e}"); features.append("Err price sensitivity.")
-
-    def _extract_discount_patterns(self, events: pl.DataFrame, features: List[str]) -> None:
-        # Placeholder - logic depends on actual discount columns
-        relevant_discount_cols = [c for c in ['discount', 'discount_percentage', 'original_price'] if c in events.columns]
-        if relevant_discount_cols:
-             features.append(f"Discount info present ({', '.join(relevant_discount_cols)}), analysis TBD.")
-
 
 class SocialFeatureExtractor(FeatureExtractorBase):
     """Extract social and competitive factors features"""
@@ -1360,18 +1284,28 @@ class SocialFeatureExtractor(FeatureExtractorBase):
                     (pl.col('event_type') == 'page_visit')
                     & pl.col('category_id').is_not_null()
                 )
-                if page_visits.height >= 10:            # au moins 10 vues
+                if page_visits.height >= 10:
                     cat_cnts = (
-                        page_visits.group_by('category_id')
-                                   .agg(pl.count().alias('cnt'))
-                                   .sort('cnt', descending=True)
+                        page_visits
+                        .group_by("category_id")
+                        .agg(pl.len().alias("cnt"))
+                        .sort("cnt", descending=True)
                     )
-                    total_views = cat_cnts['cnt'].sum()
-                    top_share   = cat_cnts.row(0)['cnt'] / total_views
-                    if top_share >= 0.75:
-                        features.append("Browsing highly concentrated on one category")
-                    elif top_share <= 0.40 and cat_cnts.height >= 3:
-                        features.append("Browsing spread across many categories")
+
+                    total_views = cat_cnts["cnt"].sum()
+
+                    if total_views and total_views > 0:
+                        top_row = cat_cnts.row(0, named=True)
+                        top_share = top_row["cnt"] / total_views
+
+                        if top_share >= 0.75:
+                            features.append(
+                                "Browsing highly concentrated on one category"
+                            )
+                        elif top_share <= 0.40 and cat_cnts.height >= 3:
+                            features.append(
+                                "Browsing spread across many categories"
+                            )
 
             # ---------- 5) Différence vue ↔ panier ----------
             view_events = product_events.filter(
@@ -1412,123 +1346,185 @@ class SocialFeatureExtractor(FeatureExtractorBase):
             self.logger.debug(f"Err popularity: {e}")
             features.append("Err popularity patterns.")
 
-class NameEmbeddingExtractor(FeatureExtractorBase):
-    """Extract features based on product name embeddings."""
-    def extract_features(self, client_id: int, events: pl.DataFrame, now: datetime) -> List[str]:
-        if not hasattr(self.parent, 'sku_properties_dict') or not self.parent.sku_properties_dict:
-            return ["Product properties unavailable."]
-        features = []
-        try:
-            product_events = events.filter(
-                pl.col('event_type').is_in(['page_visit', 'add_to_cart', 'product_buy']) 
-                & pl.col('sku').is_not_null()
-            )
-            if product_events.height == 0:
-                return []
-            
-            valid_name_embeddings = []
-            interacted_skus = product_events['sku'].unique().drop_nulls().to_list()
-            if not interacted_skus:
-                return []
-    
-            for sku in interacted_skus:
-                props = self.parent.sku_properties_dict.get(int(sku))
-                if props and isinstance(props.get('name'), str) and props['name'].startswith('[') and props['name'].endswith(']'):
-                    name_embedding_str = props['name']
-                    try:
-                        name_embedding = [int(x) for x in name_embedding_str.strip('[]').split()]
-                        if name_embedding:  # Check not empty
-                            valid_name_embeddings.append(name_embedding)
-                    except Exception:
-                        continue
-    
-            if not valid_name_embeddings:
-                return ["No valid name embeddings found."]
-            
-            first_len = len(valid_name_embeddings[0])
-            consistent_embeddings = [emb for emb in valid_name_embeddings if len(emb) == first_len]
-            if not consistent_embeddings:
-                return ["Name embeddings have inconsistent lengths."]
-            if first_len == 0:
-                return ["Name embeddings have zero length."]
-    
-            # FIX: Ensure we have a proper 2D array before operations
-            try:
-                emb_array = np.array(consistent_embeddings, dtype=np.float32)
-                if emb_array.ndim != 2 or emb_array.shape[0] == 0:
-                    return ["Invalid embedding array shape."]
-                
-                avg_vector = np.mean(emb_array, axis=0)
-                if first_len > 32:
-                    emb_array = emb_array[:, :32]
-                    avg_vector = avg_vector[:32]
-                    first_len = 32
-    
-                avg_vector_str = ", ".join([f"{x:.2f}" for x in avg_vector])
-                features.append(f"AVG_PRODUCT_NAME_EMBEDDING (Dim:{first_len}): [{avg_vector_str}] ({len(consistent_embeddings)} items)")
-    
-                # Variance calculation with shape check
-                if len(consistent_embeddings) > 1 and emb_array.shape[0] > 1:
-                    std_vector = np.std(emb_array, axis=0)
-                    avg_std = np.mean(std_vector)
-                    if avg_std < 30:
-                        features.append("Product Name Focus: High (Low Variance)")
-                    elif avg_std > 70:
-                        features.append("Product Name Focus: Low (High Variance)")
-            except Exception as e:
-                self.logger.debug(f"Error computing embeddings: {e}")
-                return ["Error processing embeddings."]
-    
-        except Exception as e:
-            self.logger.error(f"Err name embedding client {client_id}: {e}")
-            features.append("Err name embedding.")
+
+class RetailrocketGlobalPopularityFeatureExtractor(FeatureExtractorBase):
+    """
+    Extract a user's interaction coverage with globally popular Retailrocket
+    products and categories.
+
+    The global top sets are derived from product_popularity and
+    category_popularity, which are computed only from the active observation
+    history. Therefore temporal-split runs remain leakage-free.
+    """
+
+    def extract_features(
+        self,
+        client_id: int,
+        events: pl.DataFrame,
+        now: datetime,
+    ) -> List[str]:
+        features: List[str] = []
+
+        self._extract_top_sku_overlap(events, features)
+        self._extract_top_category_overlap(events, features)
+
         return features
 
-class TopSKUFeatureExtractor(FeatureExtractorBase):
-    """Focus sur les 100 SKUs scorés par la compétition"""
+    def _extract_top_sku_overlap(
+        self,
+        events: pl.DataFrame,
+        features: List[str],
+    ) -> None:
+        product_popularity = self.parent.product_popularity
 
-    def __init__(self, parent):
-        super().__init__(parent)
-        self.top_skus = parent.top_skus
+        if (
+            product_popularity is None
+            or product_popularity.is_empty()
+            or "popularity_score" not in product_popularity.columns
+        ):
+            return
 
-    def extract_features(self, client_id: int, events: pl.DataFrame, now: datetime) -> List[str]:
-        if not self.top_skus:
-            return ["Top-SKU list unavailable"]
-        sku_ev = events.filter(
-            pl.col('sku').is_in(self.top_skus) &
-            pl.col('event_type').is_in(['product_buy', 'add_to_cart', 'page_visit'])
-        )
-        if sku_ev.is_empty():
-            return ["No top-SKU interactions"]
-
-        # ------- score récence × fréquence ---------------------------------
-        rec_w = (
-            (pl.lit(now) - sku_ev['timestamp']).dt.total_seconds() / 86400 + 1
-        ).pow(-0.5)
-        sku_ev = sku_ev.with_columns(rec_w.alias('rw'))
-
-        scores = (
-            sku_ev.group_by('sku')
-                  .agg([
-                      pl.len().alias('cnt'),
-                      pl.sum('rw').alias('rScore'),
-                      pl.max('timestamp').alias('last_ts')
-                  ])
-                  .sort('rScore', descending=True)
+        product_events = events.filter(
+            pl.col("sku").is_not_null()
+            & pl.col("event_type").is_in(
+                ["page_visit", "add_to_cart", "product_buy"]
+            )
         )
 
-        feats = []
-        for i, row in enumerate(scores.head(5).iter_rows(named=True), 1):
-            delta = (now - row['last_ts']).days
-            feats.append(f"TOPSKU{i}:SKU_{row['sku']} rs={row['rScore']:.2f} "
-                         f"cnt={row['cnt']} last={delta}d")
+        if product_events.is_empty():
+            return
 
-        # Couverture
-        cov = scores.height / len(self.top_skus)
-        feats.append(f"Top-SKU coverage:{cov:.0%}")
+        global_top_skus = (
+            product_popularity
+            .sort("popularity_score", descending=True)
+            .head(TOP_RETAILROCKET_SKUS)
+            .select(["sku", "popularity_score"])
+        )
 
-        return feats
+        top_rank_by_sku = {
+            int(row["sku"]): rank
+            for rank, row in enumerate(
+                global_top_skus.iter_rows(named=True),
+                start=1,
+            )
+            if row["sku"] is not None
+        }
 
+        matched_events = product_events.filter(
+            pl.col("sku").is_in(list(top_rank_by_sku.keys()))
+        )
+
+        if matched_events.is_empty():
+            return
+
+        coverage = matched_events.height / product_events.height
+        matched_counts = (
+            matched_events
+            .group_by("sku")
+            .agg(pl.len().alias("event_count"))
+            .to_dicts()
+        )
+
+        ranked_matches = sorted(
+            matched_counts,
+            key=lambda row: (
+                top_rank_by_sku[int(row["sku"])],
+                -int(row["event_count"]),
+            ),
+        )
+
+        features.append(
+            f"GLOBAL_TOP_SKU_COVERAGE:{coverage:.1%}"
+        )
+        features.append(
+            f"GLOBAL_TOP_SKU_UNIQUE_HITS:{len(ranked_matches)}"
+        )
+
+        for row in ranked_matches[:3]:
+            sku = int(row["sku"])
+            features.append(
+                f"GLOBAL_TOP_SKU_HIT:SKU_{sku}"
+                f"(rank={top_rank_by_sku[sku]},events={int(row['event_count'])})"
+            )
+
+    def _extract_top_category_overlap(
+        self,
+        events: pl.DataFrame,
+        features: List[str],
+    ) -> None:
+        category_popularity = self.parent.category_popularity
+
+        if (
+            category_popularity is None
+            or category_popularity.is_empty()
+            or "category_popularity_score" not in category_popularity.columns
+            or "category_id" not in events.columns
+        ):
+            return
+
+        category_events = events.filter(
+            pl.col("category_id").is_not_null()
+            & pl.col("event_type").is_in(
+                ["page_visit", "add_to_cart", "product_buy"]
+            )
+        )
+
+        if category_events.is_empty():
+            return
+
+        global_top_categories = (
+            category_popularity
+            .sort("category_popularity_score", descending=True)
+            .head(TOP_RETAILROCKET_CATEGORIES)
+            .select(["category_id", "category_popularity_score"])
+        )
+
+        top_rank_by_category = {
+            int(row["category_id"]): rank
+            for rank, row in enumerate(
+                global_top_categories.iter_rows(named=True),
+                start=1,
+            )
+            if row["category_id"] is not None
+        }
+
+        matched_events = category_events.filter(
+            pl.col("category_id").is_in(list(top_rank_by_category.keys()))
+        )
+
+        if matched_events.is_empty():
+            return
+
+        coverage = matched_events.height / category_events.height
+        matched_counts = (
+            matched_events
+            .group_by("category_id")
+            .agg(pl.len().alias("event_count"))
+            .to_dicts()
+        )
+
+        ranked_matches = sorted(
+            matched_counts,
+            key=lambda row: (
+                top_rank_by_category[int(row["category_id"])],
+                -int(row["event_count"]),
+            ),
+        )
+
+        features.append(
+            f"GLOBAL_TOP_CATEGORY_COVERAGE:{coverage:.1%}"
+        )
+        features.append(
+            f"GLOBAL_TOP_CATEGORY_UNIQUE_HITS:{len(ranked_matches)}"
+        )
+
+        for row in ranked_matches[:3]:
+            category_id = int(row["category_id"])
+            features.append(
+                f"GLOBAL_TOP_CATEGORY_HIT:CAT_{category_id}"
+                f"(rank={top_rank_by_category[category_id]},"
+                f"events={int(row['event_count'])})"
+            )
 # --- Main Generator Class ---
 # --- Constants for raw sequence generation ---
 SEP_TOKEN = "</s>"
@@ -1697,187 +1693,13 @@ class AdvancedUBMGenerator:
         self.global_stats: Dict[str, Any] = {}
         self.user_segments: Dict[str, List[int]] = {}
         self._extractors: Dict[str, Any] = {}
-        self.top_skus: list[int] = []
-        try:
-            # ex : array([123, 456, …])
-            self.top_skus = list(np.load(self.data_dir / "target/propensity_sku.npy"))
-        except Exception:
-            self.logger.warning("Top-SKU list not found – SKU_PROPENSITY features disabled")
-
-        self.top_categories: list[int] = []
-        try:
-            self.top_categories = list(np.load(self.data_dir / "target/propensity_category.npy"))
-        except Exception:
-            self.logger.warning("Top-category list not found – CAT_PROPENSITY features disabled")
+        self.dataset_end: Optional[datetime] = None
+        self.reference_time: Optional[datetime] = None
 
 
         self.logger = logging.getLogger(self.__class__.__name__)
-        self.url_freq_threshold = URL_FREQ_THRESHOLD
-        self.sku_pop_threshold  = SKU_POP_THRESHOLD
         if self.debug_mode:
             self.logger.setLevel(logging.DEBUG)
-            
-    def _setup_lazy_pipeline_only(self) -> None:
-        """
-        Set up the lazy pipeline without collecting any data.
-        Used by streaming generator to avoid double loading.
-        """
-        self.logger.info("Setting up lazy pipeline (no data collection)")
-        
-        # 1) Load product properties for join if available
-        props_path = self.data_dir / "product_properties.parquet"
-        if props_path.exists():
-            prop = pl.read_parquet(props_path)
-            emb_source = None
-            if "embedding" in prop.columns:
-                emb_source = "embedding"
-            elif "name" in prop.columns:
-                # Check if it looks like an embedding
-                sample = prop["name"].head(1)
-                if sample.len() > 0 and str(sample[0]).strip().startswith("["):
-                    emb_source = "name"
-    
-            cols = ["sku", "category", "price"] + ([emb_source] if emb_source else [])
-            tmp = prop.select(cols)
-            rename_map = {"category": "category_id", "price": "price_bucket"}
-            if emb_source:
-                rename_map[emb_source] = "emb_str"
-            self.sku_properties_for_join = tmp.rename(rename_map).with_columns(
-                pl.col("sku").cast(pl.Int64)
-            )
-            # Note: sku_properties_dict should already be loaded from cache
-        
-        # 2) Build lazy scans & union
-        event_types = ["product_buy", "add_to_cart", "remove_from_cart", "page_visit", "search_query"]
-        schema = {
-            "client_id": pl.Int64,
-            "timestamp": pl.Datetime("us"),
-            "sku": pl.Int64,
-            "url": pl.Utf8,
-            "query": pl.Utf8
-        }
-    
-        lazy_sources = []
-        for et in event_types:
-            fp = self.data_dir / f"{et}.parquet"
-            if not fp.exists():
-                self.logger.warning(f"Skipping missing file {fp}")
-                continue
-            
-            scan = pl.scan_parquet(fp)
-            lf_schema = scan.collect_schema()
-            
-            exprs = []
-            for col, dt in schema.items():
-                if col in lf_schema:
-                    col_expr = pl.col(col)
-                    if lf_schema[col] != dt:
-                        if col == "timestamp":
-                            col_expr = col_expr.cast(pl.Utf8).str.to_datetime(
-                                strict=False, time_unit="us"
-                            ).cast(dt)
-                        else:
-                            col_expr = col_expr.cast(dt, strict=False)
-                    exprs.append(col_expr.alias(col))
-                else:
-                    exprs.append(pl.lit(None).cast(dt).alias(col))
-            
-            exprs.append(pl.lit(et).alias("event_type"))
-            lazy_sources.append(scan.select(exprs))
-    
-        if not lazy_sources:
-            raise ValueError("No event files found.")
-    
-        # Union all sources
-        lf_all = pl.concat(lazy_sources)
-    
-        # 3) Join product properties lazily
-        if self.sku_properties_for_join is not None:
-            lf_all = lf_all.join(
-                self.sku_properties_for_join.lazy(),
-                on="sku",
-                how="left"
-            )
-    
-        # 4) Store the lazy pipeline
-        self.lazy_all = lf_all
-        
-        # 5) Initialize centrality attributes if not already present
-        if not hasattr(self, 'sku_centrality'):
-            self.sku_centrality = {}
-        if not hasattr(self, 'cat_centrality'):
-            self.cat_centrality = {}
-        if not hasattr(self, 'category_centrality'):
-            self.category_centrality = {}
-        
-        # Initialize URL embedding attributes
-        if not hasattr(self, 'url_embed'):
-            self.url_embed = {}
-        if not hasattr(self, 'url_centroid'):
-            self.url_centroid = None
-        if not hasattr(self, 'url_cluster_map'):
-            self.url_cluster_map = {}
-        
-        # Initialize SKU clustering attributes  
-        if not hasattr(self, 'sku_cluster_map'):
-            self.sku_cluster_map = {}
-        
-        # Initialize user segments if not present
-        if not hasattr(self, 'user_segments'):
-            self.user_segments = {}
-        
-        # Initialize popularity score mapping
-        if not hasattr(self, 'pop_score_by_sku'):
-            self.pop_score_by_sku = {}
-            # Try to build it from product_popularity if available
-            if self.product_popularity is not None and 'sku' in self.product_popularity.columns and 'popularity_score' in self.product_popularity.columns:
-                try:
-                    self.pop_score_by_sku = {
-                        int(row['sku']): float(row['popularity_score']) 
-                        for row in self.product_popularity[['sku', 'popularity_score']].iter_rows(named=True)
-                        if row['sku'] is not None and row['popularity_score'] is not None
-                    }
-                except Exception as e:
-                    self.logger.warning(f"Failed to build pop_score_by_sku: {e}")
-        
-        # Initialize category_popularity if not present
-        if not hasattr(self, 'category_popularity'):
-            self.category_popularity = None
-        
-        # 6) Initialize extractors based on what we know from cache
-        self._extractors = {}
-        self._extractors['temporal'] = TemporalFeatureExtractor(self)
-        self._extractors['sequence'] = SequenceFeatureExtractor(self)
-
-     
-        # Add other extractors based on available data
-        # (we know from the schema what columns are available)
-        if self.sku_properties_for_join is not None:
-            if 'category_id' in self.sku_properties_for_join.columns:
-                self._extractors['graph'] = GraphFeatureExtractor(self)
-            if 'price_bucket' in self.sku_properties_for_join.columns:
-                self._extractors['price'] = PriceFeatureExtractor(self)
-            if 'emb_str' in self.sku_properties_for_join.columns:
-                self._extractors['name_embedding'] = NameEmbeddingExtractor(self)
-        
-        self._extractors['intent'] = IntentFeatureExtractor(self)
-        
-        if self.product_popularity is not None:
-            self._extractors['social'] = SocialFeatureExtractor(self)
-            
-        if self.top_skus:
-            self._extractors['top_sku'] = TopSKUFeatureExtractor(self)
-
-        if self.top_categories:
-            self._extractors['top_category'] = TopCategoryFeatureExtractor(self)
-        
-        # Add ChurnPropensityExtractor if it exists
-        try:
-            self._extractors['churn_propensity'] = ChurnPropensityExtractor(self)
-        except NameError:
-            pass  # ChurnPropensityExtractor not defined
-        
-        self.logger.info("Lazy pipeline ready (no data materialized)")
             
     def _reset_data(self):
         self.logger.warning("Resetting internal dataframes and stats.")
@@ -1892,208 +1714,303 @@ class AdvancedUBMGenerator:
         self._extractors = {}
         gc.collect()
 
-    def load_data(self,
-                      use_cache: bool = True,
-                      relevant_client_ids: Optional[List[int]] = None) -> None:
-            """
-            Entry-point: builds lazy pipeline from parquet sources and joins.
+    def load_data(
+        self,
+        use_cache: bool = True,
+        relevant_client_ids: Optional[List[int]] = None,
+        observation_end: Optional[datetime] = None,
+    ) -> None:
+            """            
+            Build the Retailrocket event pipeline and derived profile features.
+    
+            Events are loaded from events.csv and enriched with confirmed
+            Retailrocket item properties: category_id and time-dependent
+            availability. If observation_end is provided, only earlier
+            interactions are used for profile construction and global statistics.
             """
             self.logger.info(f"=== load_data called with use_cache={use_cache}, "
-                             f"relevant_clients={len(relevant_client_ids) if relevant_client_ids else 'None'}")
+                             f"relevant_clients={len(relevant_client_ids) if relevant_client_ids else 'None'}, "
+                             f"observation_end={observation_end}")
             
-            # 1. Déterminer quel fichier cache utiliser
-            if relevant_client_ids is not None and len(relevant_client_ids) <= 1_000_000:
-                cache_file = self.cache_dir / "events_1m_clients.parquet"
-                self.logger.info(f"Using filtered cache for 1M clients")
-            else:
-                cache_file = self.cache_dir / "all_events_processed.parquet"
-                self.logger.info(f"Using full cache")
-            
-            # if self.debug_mode and relevant_client_ids and len(relevant_client_ids) < 100:
-            #     # En mode debug avec peu de clients, filtrer aussi les SKU properties
-            #     if 'sku' in df.columns:
-            #         client_skus = set(df['sku'].drop_nulls().unique().to_list())
-            
-            # 3. Essayer de charger depuis le cache
-            if use_cache and cache_file.exists():
-                try:
-                    self.logger.info(f"Loading events cache: {cache_file}")
-                    
-                    # Vérifier que les stats globales existent (sauf en debug)
-                    if not self.debug_mode and not (self.cache_dir / "global_stats.json").exists():
-                        self.logger.warning("Global stats missing - need to recompute")
-                        self._reset_data()
-                    else:
-                        # Charger le cache events
-                        df = pl.read_parquet(cache_file)
-                        
-                        # ✅ FIX #1 : TOUJOURS filtrer si relevant_client_ids est fourni
-                        if relevant_client_ids is not None:
-                            original_height = df.height
-                            self.logger.info(f"Filtering {original_height:,} events to {len(relevant_client_ids)} clients...")
-                            df = df.filter(pl.col("client_id").is_in(relevant_client_ids))
-                            self.logger.info(f"After filtering: {df.height:,} events (reduced by {original_height - df.height:,})")
-                            
-                            # Si après filtrage on a 0 events, logger un warning
-                            if df.height == 0:
-                                self.logger.warning(f"No events found for clients {relevant_client_ids[:5]}...")
-                        
-                        # Charger les stats calculées
-                        if self._load_calculated_data_from_cache() and df.height > 0:
-                            self.events_df = df
-                            
-                            # ✅ FIX #3 : Réduire les SKU properties en mode debug
-                            if self.debug_mode and relevant_client_ids and len(relevant_client_ids) < 100:
-                                if 'sku' in df.columns and hasattr(self, 'sku_properties_dict') and self.sku_properties_dict:
-                                    # Récupérer les SKUs utilisés par ces clients
-                                    client_skus = set(df['sku'].drop_nulls().unique().to_list())
-                                    
-                                    # Filtrer le dictionnaire des SKU properties
-                                    filtered_dict = {
-                                        k: v for k, v in self.sku_properties_dict.items() 
-                                        if k in client_skus
-                                    }
-                                    
-                                    old_size = len(self.sku_properties_dict)
-                                    self.sku_properties_dict = filtered_dict
-                                    
-                                    self.logger.info(f"Debug mode: Reduced SKU properties from {old_size:,} to {len(self.sku_properties_dict):,}")
-                                    
-                                    # Libérer la mémoire
-                                    import gc
-                                    gc.collect()
-                            
-                            self.logger.info(f"Loaded all data from cache. Events shape: {df.shape}")
-                            return  # ← SUCCESS ! On sort ici
-                        
-                        self.logger.warning("Cache incomplete or empty → reloading from source.")
-                        self._reset_data()
-                        
-                except Exception as e:
-                    self.logger.warning(f"Failed loading cache ({e}) → reloading from source.")
-                    self._reset_data()
-            
+                        # ============================================================
+            # Load Retailrocket source data
             # ============================================================
-            # Si on arrive ici, on doit charger depuis les fichiers source
-            # ============================================================
-            self.logger.info("Loading from source files...")
-            
-            # Charger les propriétés des produits
-            props_path = self.data_dir / "product_properties.parquet"
-            if props_path.exists():
-                prop = pl.read_parquet(props_path)
-                emb_source = None
-                
-                # Détecter la colonne d'embedding
-                if "embedding" in prop.columns:
-                    emb_source = "embedding"
-                elif "name" in prop.columns and prop["name"].head(1)[0].strip().startswith("["):
-                    emb_source = "name"
-    
-                # Sélectionner et renommer les colonnes
-                cols = ["sku", "category", "price"] + ([emb_source] if emb_source else [])
-                tmp = prop.select(cols)
-                rename_map = {"category": "category_id", "price": "price_bucket"}
-                if emb_source:
-                    rename_map[emb_source] = "emb_str"
-                    
-                self.sku_properties_for_join = tmp.rename(rename_map).with_columns(pl.col("sku").cast(pl.Int64))
-                self.sku_properties_dict = {
-                    int(r["sku"]): {k:v for k,v in r.items() if k!="sku"}
-                    for r in prop.to_dicts() if r.get("sku") is not None
-                }
-                self.logger.info(f"Loaded {len(self.sku_properties_dict)} product properties.")
-            else:
-                self.logger.warning("No properties file → skipping embedding joins.")
-    
-            # Construire les lazy scans pour chaque type d'événement
-            event_types = ["product_buy", "add_to_cart", "remove_from_cart", "page_visit", "search_query"]
-            schema = {
-                "client_id": pl.Int64,
-                "timestamp": pl.Datetime("us"),
-                "sku": pl.Int64,
-                "url": pl.Utf8,
-                "query": pl.Utf8
-            }
-    
-            lazy_sources = []
-            for et in event_types:
-                fp = self.data_dir / f"{et}.parquet"
-                if not fp.exists():
-                    self.logger.warning(f"Skipping missing file {fp}")
-                    continue
-                    
-                scan = pl.scan_parquet(fp)
-                lf_schema = scan.collect_schema()
-                exprs = []
-                
-                # Harmoniser les colonnes
-                for col, dt in schema.items():
-                    if col in lf_schema:
-                        col_expr = pl.col(col)
-                        if lf_schema[col] != dt:
-                            if col == "timestamp":
-                                col_expr = col_expr.cast(pl.Utf8).str.to_datetime(strict=False, time_unit="us").cast(dt)
-                            else:
-                                col_expr = col_expr.cast(dt, strict=False)
-                        exprs.append(col_expr.alias(col))
-                    else:
-                        exprs.append(pl.lit(None).cast(dt).alias(col))
-                        
-                exprs.append(pl.lit(et).alias("event_type"))
-                lazy_sources.append(scan.select(exprs))
-    
-            if not lazy_sources:
-                raise ValueError("No event files found.")
-    
-            # Union de tous les événements
-            lf_all = pl.concat(lazy_sources)
-    
-            # Joindre les propriétés des produits
-            if self.sku_properties_for_join is not None:
-                lf_all = lf_all.join(
-                    self.sku_properties_for_join.lazy(),
-                    on="sku",
-                    how="left"
+            self.logger.info("Loading Retailrocket source files...")
+
+            events_path = self.data_dir / "events.csv"
+
+            if not events_path.exists():
+                raise FileNotFoundError(
+                    f"Retailrocket events file not found: {events_path}"
                 )
+
+            # Retailrocket raw schema:
+            # timestamp, visitorid, event, itemid, transactionid
     
-            # Filtrer en mode debug
-            if self.debug_mode and relevant_client_ids is not None:
-                self.logger.debug(f"DEBUG: filtrage lazy sur {len(relevant_client_ids)} clients")
-                lf_all = lf_all.filter(pl.col("client_id").is_in(relevant_client_ids))
-    
-            # Stocker le pipeline lazy
+            # Internal Retailrocket profile schema:
+            # client_id, timestamp, sku, event_type, transaction_id
+            lf_all = (
+                pl.scan_csv(events_path)
+                .select([
+                    pl.col("visitorid")
+                      .cast(pl.Int64)
+                      .alias("client_id"),
+
+                    pl.from_epoch(
+                        pl.col("timestamp").cast(pl.Int64),
+                        time_unit="ms"
+                    ).alias("timestamp"),
+
+                    pl.col("itemid")
+                      .cast(pl.Int64)
+                      .alias("sku"),
+
+                    pl.when(pl.col("event") == "view")
+                      .then(pl.lit("page_visit"))
+                      .when(pl.col("event") == "addtocart")
+                      .then(pl.lit("add_to_cart"))
+                      .when(pl.col("event") == "transaction")
+                      .then(pl.lit("product_buy"))
+                      .otherwise(pl.col("event"))
+                      .cast(pl.Categorical)
+                      .alias("event_type"),
+                    pl.col("transactionid")
+                      .cast(pl.Int64, strict=False)
+                      .alias("transaction_id"),
+                ])
+            )
+
+            # Optional filtering for fast local tests.
+            # Dataset-relative reference time must be computed before optional
+            # debug filtering, otherwise each test user appears artificially recent.
+                        # ============================================================
+            # Determine temporal observation boundary
+            # ============================================================
+            dataset_end_df = (
+                lf_all
+                .select(pl.col("timestamp").max().alias("dataset_end"))
+                .collect(engine="streaming")
+            )
+            self.dataset_end = dataset_end_df["dataset_end"][0]
+
+            if self.dataset_end is None:
+                raise ValueError("Retailrocket dataset contains no valid timestamps.")
+
+            # When observation_end is provided, all profiles and global
+            # statistics must be built only from historical events.
+            self.reference_time = observation_end or self.dataset_end
+
+            if observation_end is not None:
+                self.logger.info(
+                    f"Using observation cutoff: {self.reference_time}"
+                )
+                lf_all = lf_all.filter(
+                    pl.col("timestamp") < pl.lit(self.reference_time)
+                )
+            else:
+                self.logger.info(
+                    f"Retailrocket global reference time set to {self.reference_time}"
+                )
+
+        
+            if relevant_client_ids is not None:
+                self.logger.info(
+                    f"Keeping full observation history for global statistics; "
+                    f"{len(relevant_client_ids)} clients selected for profile testing"
+                )
+
+            # ============================================================
+            # Load Retailrocket item categories
+            # ============================================================
+            properties_paths = [
+                self.data_dir / "item_properties_part1.csv",
+                self.data_dir / "item_properties_part2.csv",
+            ]
+
+            missing_property_files = [
+                str(path) for path in properties_paths if not path.exists()
+            ]
+            if missing_property_files:
+                raise FileNotFoundError(
+                    "Missing Retailrocket item-properties files: "
+                    + ", ".join(missing_property_files)
+                )
+
+            category_properties = (
+                pl.concat([
+                    pl.scan_csv(properties_paths[0]),
+                    pl.scan_csv(properties_paths[1]),
+                ])
+                .filter(pl.col("property") == "categoryid")
+                .select([
+                    pl.col("itemid")
+                      .cast(pl.Int64)
+                      .alias("sku"),
+
+                    pl.from_epoch(
+                        pl.col("timestamp").cast(pl.Int64),
+                        time_unit="ms"
+                    ).alias("property_timestamp"),
+
+                    pl.col("value")
+                      .cast(pl.Int64, strict=False)
+                      .alias("category_id"),
+                ])
+                .filter(
+                    pl.col("category_id").is_not_null()
+                    & (pl.col("property_timestamp") <= pl.lit(self.reference_time))
+                )
+                .sort(["sku", "property_timestamp"])
+                .group_by("sku")
+                .agg(
+                    pl.col("category_id").last().alias("category_id")
+                )
+                .collect(engine="streaming")
+            )
+
+            self.logger.info(
+                f"Loaded latest category assignments for "
+                f"{category_properties.height:,} items."
+            )
+
+            self.sku_properties_for_join = category_properties
+            self.sku_properties_dict = {
+                int(row["sku"]): {"category": int(row["category_id"])}
+                for row in category_properties.iter_rows(named=True)
+                if row["sku"] is not None and row["category_id"] is not None
+            }
+
+            lf_all = lf_all.join(
+                category_properties.lazy(),
+                on="sku",
+                how="left",
+            )
+
+            # ============================================================
+            # Load Retailrocket item availability
+            # ============================================================
+            # Availability is time-dependent. Therefore it must be joined
+            # as of the event timestamp and not as one static value per SKU.
+            availability_properties = (
+                pl.concat([
+                    pl.scan_csv(properties_paths[0]),
+                    pl.scan_csv(properties_paths[1]),
+                ])
+                .filter(pl.col("property") == "available")
+                .select([
+                    pl.col("itemid")
+                      .cast(pl.Int64)
+                      .alias("sku"),
+
+                    pl.from_epoch(
+                        pl.col("timestamp").cast(pl.Int64),
+                        time_unit="ms"
+                    ).alias("property_timestamp"),
+
+                    pl.col("value")
+                      .cast(pl.Int8, strict=False)
+                      .alias("is_available"),
+                ])
+                .filter(
+                    pl.col("is_available").is_not_null()
+                    & (pl.col("property_timestamp") <= pl.lit(self.reference_time))
+                )
+                .sort(["sku", "property_timestamp"])
+                .collect(engine="streaming")
+            )
+
+            self.logger.info(
+                f"Loaded availability history with "
+                f"{availability_properties.height:,} property rows."
+            )
+
+            # Join the most recent availability state known at each event time.
+            lf_all = (
+                lf_all
+                .sort(["sku", "timestamp"])
+                .join_asof(
+                    availability_properties.lazy(),
+                    left_on="timestamp",
+                    right_on="property_timestamp",
+                    by="sku",
+                    strategy="backward",
+                )
+                .drop("property_timestamp")
+            )
+
             self.lazy_all = lf_all
-    
-            # Calculer les statistiques globales
-            self._compute_global_statistics()
-    
-            # En mode debug, matérialiser immédiatement
+            self._extractors = {}
+
+            # ============================================================
+            # Restore or compute derived Retailrocket statistics
+            # ============================================================
+            # Shared caches may only be reused for a full-history run.
+            # A temporal observation cutoff requires separate computation
+            # to prevent future information from entering the profile.
+            can_restore_shared_cache = (
+                use_cache
+                and not self.debug_mode
+                and observation_end is None
+            )
+
+            cache_loaded = False
+
+            if can_restore_shared_cache:
+                cache_loaded = self._load_calculated_data_from_cache(
+                    expected_reference_time=self.reference_time,
+                )
+
+            if not cache_loaded:
+                self._compute_global_statistics()
+
+            # ============================================================
+            # Debug mode: materialize only selected clients and stop here
+            # ============================================================
             if self.debug_mode and relevant_client_ids is not None:
-                self.logger.debug(f"DEBUG: materializing events_df pour {len(relevant_client_ids)} clients")
+                self.logger.debug(
+                    f"DEBUG: materializing events_df for "
+                    f"{len(relevant_client_ids)} clients"
+                )
+
                 self.events_df = (
                     self.lazy_all
                     .filter(pl.col("client_id").is_in(relevant_client_ids))
                     .sort(["client_id", "timestamp"])
-                    .collect(engine='streaming')
+                    .collect(engine="streaming")
                 )
+
+                # Required for correct buyer/browser labels in debug profiles.
+                self._segment_users()
                 return
-                
-            # Clustering et autres calculs globaux (seulement si pas en debug)
-            if self.sku_properties_for_join is not None and "emb_str" in self.sku_properties_for_join.columns:
-                self._cluster_sku_embeddings()
-            
-            self._build_url_graph_embeddings()
-            self._segment_users()
-            self._build_global_centralities()
-    
-            # Sauvegarder le cache en mode normal
-            if use_cache and not self.debug_mode:
-                df_all = lf_all.sort(["client_id", "timestamp"]).collect(engine='streaming')
-                self.events_df = df_all
-                df_all.write_parquet(cache_file)
-                self._save_calculated_data_to_cache()
-                self.logger.info("Cache rebuilt and saved.")
+
+            # ============================================================
+            # Full-mode derived computations
+            # ============================================================
+            if not cache_loaded:
+                # Retailrocket provides behavioral events, categories and
+                # availability, but no validated product-name or URL embeddings.
+                self._segment_users()
+                self._build_global_centralities()
+
+                if use_cache and not self.debug_mode:
+                    if observation_end is None:
+                        self._save_calculated_data_to_cache()
+                        self.logger.info(
+                            "Saved derived Retailrocket statistics to cache. "
+                            "Event data remains lazy."
+                        )
+                    else:
+                        self.logger.info(
+                            "Skipping shared derived-cache write for "
+                            "cutoff-based run to avoid mixing temporal "
+                            "evaluation states."
+                        )
+            else:
+                self.logger.info(
+                    "Reusing cached Retailrocket derived features; "
+                    "skipping global statistics, segmentation, and "
+                    "centrality recomputation."
+                )
             
     def _collect_client_events(self, client_id: int) -> pl.DataFrame:
         """Pulls down only one client's events into memory."""
@@ -2105,191 +2022,7 @@ class AdvancedUBMGenerator:
               .sort("timestamp")
               .collect(engine='streaming')
         )
-
-    # ------------------------------------------------------------------ #
-    # === Helpers extraits de load_data (lazy-aware) ==================== #
-    def _cluster_sku_embeddings(self) -> None:
-        """Version corrigée avec protection contre arrays vides"""
-        if self.lazy_all is None:
-            return
-        
-        lf = (
-            self.lazy_all
-              .filter(pl.col("emb_str").is_not_null())
-              .select(["sku", "emb_str"])       
-              .unique()
-        )
-        prop_emb = lf.collect(engine='streaming')
-        if prop_emb.is_empty():
-            self.logger.info("No embedding rows to cluster.")
-            return
     
-        skus, vecs = [], []
-        for row in prop_emb.iter_rows(named=True):
-            try:
-                arr = np.fromstring(row["emb_str"].strip("[]"), sep=" ")
-                if arr.size > 0:  # Check array not empty
-                    norm = np.linalg.norm(arr)
-                    if norm > 0:
-                        vecs.append(arr / norm)
-                        skus.append(int(row["sku"]))
-            except Exception:
-                continue
-    
-        if vecs and len(vecs) > 0:  # Extra check
-            try:
-                X = np.vstack(vecs)
-                if X.shape[0] > 0:  # Ensure we have rows
-                    n_clusters = min(50, X.shape[0])  # Don't use more clusters than samples
-                    mbk = MiniBatchKMeans(n_clusters=n_clusters, batch_size=4096, random_state=42).fit(X)
-                    self.sku_cluster_map = {sku: int(lbl) for sku, lbl in zip(skus, mbk.labels_)}
-                    self.logger.info(f"Built SKU clusters for {len(self.sku_cluster_map)} SKUs.")
-                else:
-                    self.logger.info("No valid embeddings after vstack.")
-            except Exception as e:
-                self.logger.error(f"SKU clustering failed: {e}")
-        else:
-            self.logger.info("No valid embeddings for SKU clustering.")
-
-
-    # ─────────────────────────────────────────────────────────────
-    #  AdvancedUBMGenerator._build_url_graph_embeddings  (NEW)
-    # ─────────────────────────────────────────────────────────────
-    def _build_url_graph_embeddings(self) -> None:
-        """
-        Full-streaming URL⇆SKU bipartite graph:
-          1. écrit (src_hash, dst_hash) dans un CSV par blocs de 1 M lignes
-          2. lit le CSV chunk par chunk pour créer le graphe NetworKit
-          3. Node2Vec 32 d puis k-means (20 clusters)
-        Pic RAM ≈ 3-4 Go quel que soit le dataset.
-        """
-        # ---------------------------------------------------------
-    
-        if self.lazy_all is None:
-            return
-        if os.getenv("SKIP_URL_GRAPH", "0") == "1":
-            self.logger.info("SKIP_URL_GRAPH=1 → URL-SKU graph bypassed.")
-            self.url_embed, self.url_centroid, self.url_cluster_map = {}, None, {}
-            return
-    
-        self.logger.info("Building URL–SKU bipartite graph (streaming)…")
-    
-        # ── 1) TOP-N URLs (petit collect) ─────────────────────────
-        TOP_URLS = 500
-        top_urls = (
-            self.lazy_all
-              .filter(pl.col("url").is_not_null())
-              .group_by("url")
-              .agg(pl.count().alias("cnt"))
-              .sort("cnt", descending=True)
-              .limit(TOP_URLS)             # .head() == .limit()
-              .collect()                   # ← on retire le streaming=True
-              ["url"]
-              .to_list()
-        )
-        top_urls = set(top_urls)
-    
-        # ── 2) génère (sid, url_hash) et (sid, sku_hash) ──────────
-        with_sid = (
-            self.lazy_all
-              .filter(pl.col("url").is_not_null() | pl.col("sku").is_not_null())
-              .with_columns(
-                  (
-                      (
-                          (pl.col("timestamp")
-                             .diff()
-                             .over("client_id")
-                             .dt.total_seconds() / 60)
-                          .fill_null(1e9)  > 30
-                      ) | (pl.col("client_id").diff().is_not_null())
-                  ).alias("new_sess")
-              )
-              .with_columns(
-                  pl.col("new_sess").cum_sum().over("client_id").alias("sid")
-              )
-        )
-    
-        MASK63 = (1 << 63) - 1            # 0x7FFF…FFFF
-        
-        urls = (
-            with_sid
-              .filter(pl.col("url").is_in(top_urls))
-              .select([
-                  "sid",
-                  (
-                      (pl.col("url")
-                         .hash(seed=0)        # UInt64
-                         % MASK63             # <= 2^63-1  
-                      )
-                      .cast(pl.Int64)         # signé OK
-                  ).alias("url_hash")
-              ])
-              .unique()
-        )
-    
-        skus = (
-            with_sid
-              .filter(pl.col("sku").is_not_null())
-              .select([
-                  "sid",
-                  (pl.col("sku") * -1).cast(pl.Int64).alias("sku_hash")
-              ])
-              .unique()
-        )
-    
-        # ── 3) jointure croisée → edges.csv (streaming v2 OK) ────
-        edges_lf = (
-            urls.join(skus, on="sid")
-                .select([
-                    pl.col("url_hash").alias("src_hash"),
-                    pl.col("sku_hash").alias("dst_hash")
-                ])
-        )
-        
-        import networkit as nk
-        g, label2nid = nk.Graph(0, weighted=True, directed=False), {}
-        def _nid(lbl: int) -> int:
-            return label2nid.setdefault(lbl, g.addNode())
-        
-        BATCH = 1_000_000   # lignes
-        stream = edges_lf.iter_batches(batch_size=BATCH, streaming=True)
-        for tbl in stream:                         # PyArrow Table
-            src = tbl.column(0).to_numpy(zero_copy_only=False)
-            dst = tbl.column(1).to_numpy(zero_copy_only=False)
-            g.addEdges(np.vectorize(_nid)(src), np.vectorize(_nid)(dst))
-        
-        self.logger.info("Graph nodes=%d edges=%d", g.numberOfNodes(), g.numberOfEdges())
-    
-        # ── 5) Node2Vec 32 d  ─────────────────────────────────────
-        n2v = nk_embed.Node2Vec(g, 1.0, 1.0, 10, 10, 32)
-        n2v.run()
-        emb = n2v.getFeatures()
-    
-        # ── 6) embeddings & centroid ──────────────────────────────
-        self.url_embed = {
-            lbl: emb[nid] for lbl, nid in label2nid.items() if lbl >= 0
-        }
-        if not self.url_embed:
-            self.logger.warning("No URL embeddings – aborting.")
-            self.url_centroid, self.url_cluster_map = None, {}
-            return
-        self.url_centroid = np.stack(list(self.url_embed.values())).mean(axis=0)
-    
-        # ── 7) k-means (20) pour clusteriser les URLs ─────────────
-        try:
-            u, vec = zip(*self.url_embed.items())
-            km = MiniBatchKMeans(n_clusters=20, batch_size=4096, random_state=42)
-            labels = km.fit_predict(np.stack(vec))
-            self.url_cluster_map = {ui: int(lb) for ui, lb in zip(u, labels)}
-            self.logger.info("URL clusters: %d", len(set(labels)))
-        except Exception as e:
-            self.logger.error("URL clustering failed: %s", e)
-            self.url_cluster_map = {}
-    
-        self.logger.info("Node2Vec done: %d URL vectors", len(self.url_embed))
-    # ─────────────────────────────────────────────────────────────
-
-    # ──────────────────────────────────────────────────────────────
     # ------------------------------------------------------------------ #
     # Cat->Cat centralité globale (PageRank sur transitions)           #
     # ------------------------------------------------------------------ #
@@ -2320,12 +2053,23 @@ class AdvancedUBMGenerator:
             self.cat_centrality = {}
         else:
             arr = np.array(df.to_numpy(), dtype=int)
-            src, dst = arr[:,0], arr[:,1]
-            unique_edges, counts = np.unique(np.stack([src,dst],axis=1), axis=0, return_counts=True)
-            se, de = unique_edges[:,0], unique_edges[:,1]
+            src, dst = arr[:, 0], arr[:, 1]
+
+            unique_edges, counts = np.unique(
+                np.stack([src, dst], axis=1),
+                axis=0,
+                return_counts=True,
+            )
+
+            se, de = unique_edges[:, 0], unique_edges[:, 1]
             self.cat_centrality = compute_sparse_pagerank(se, de, counts)
 
-        self.logger.info(f"Built sparse category centrality • CAT:{len(self.cat_centrality)}")
+        # Existing helper methods use both names.
+        self.category_centrality = self.cat_centrality
+
+        self.logger.info(
+            f"Built sparse category centrality • CAT:{len(self.cat_centrality)}"
+        )
 
 
     # ------------------------------------------------------------------ #
@@ -2370,7 +2114,7 @@ class AdvancedUBMGenerator:
             .to_list()
         )
         
-        sample_size = min(100_000, len(all_clients) // 10)
+        sample_size = min(100_000, max(1, len(all_clients) // 10))
         sampled_clients = np.random.choice(all_clients, sample_size, replace=False)
         
         print(f"Sampling {sample_size:,} clients out of {len(all_clients):,}")
@@ -2466,119 +2210,290 @@ class AdvancedUBMGenerator:
         
     # --- _save & _load calculated data (unchanged) ---
     def _save_calculated_data_to_cache(self) -> None:
+        """
+        Save derived Retailrocket statistics and graph features.
+
+        The raw event pipeline is intentionally not materialized here.
+        It is rebuilt lazily from the CSV files on each run, while expensive
+        derived statistics can be restored from this cache.
+        """
         if not self.cache_dir:
             return
+
         try:
-            # Prepare serializable stats
-            serializable_stats = {}
-            for k, v in self.global_stats.items():
-                if isinstance(v, np.ndarray):
-                    # Convert numpy arrays to lists for JSON serialization
-                    # Make sure to convert to native Python types
-                    serializable_stats[k] = [int(x) if isinstance(x, np.integer) else float(x) for x in v.tolist()]
-                elif isinstance(v, (int, float, str, bool, list, dict)):
-                    serializable_stats[k] = v
-                elif isinstance(v, (np.integer, np.floating)):
-                    # Convert numpy scalars to Python types
-                    serializable_stats[k] = v.item()
-                else:
-                    # For other types, convert to string
-                    serializable_stats[k] = str(v)
-            
-            # Save to JSON
-            with open(self.cache_dir / 'global_stats.json', 'w') as f:
-                json.dump(serializable_stats, f, indent=2)
-    
-            # Save user segments
-            serializable_segments = {
-                k: list(v) if isinstance(v, (set, list)) else v
-                for k, v in self.user_segments.items()
+            self.cache_dir.mkdir(parents=True, exist_ok=True)
+
+            # ------------------------------------------------------------
+            # Cache metadata: prevents accidental reuse for another setup.
+            # ------------------------------------------------------------
+            metadata = {
+                "cache_version": "retailrocket_full_v1",
+                "dataset_end": (
+                    self.dataset_end.isoformat()
+                    if self.dataset_end is not None
+                    else None
+                ),
+                "reference_time": (
+                    self.reference_time.isoformat()
+                    if self.reference_time is not None
+                    else None
+                ),
+                "dataset_type": "retailrocket",
             }
-            with open(self.cache_dir / 'user_segments.json', 'w') as f:
+
+            with open(
+                self.cache_dir / "retailrocket_cache_metadata.json",
+                "w",
+                encoding="utf-8",
+            ) as f:
+                json.dump(metadata, f, indent=2)
+
+            # ------------------------------------------------------------
+            # Global statistics
+            # ------------------------------------------------------------
+            serializable_stats = {}
+
+            for key, value in self.global_stats.items():
+                if isinstance(value, np.ndarray):
+                    serializable_stats[key] = value.tolist()
+                elif isinstance(value, (np.integer, np.floating)):
+                    serializable_stats[key] = value.item()
+                else:
+                    serializable_stats[key] = value
+
+            with open(
+                self.cache_dir / "global_stats.json",
+                "w",
+                encoding="utf-8",
+            ) as f:
+                json.dump(serializable_stats, f, indent=2)
+
+            # ------------------------------------------------------------
+            # User segments
+            # ------------------------------------------------------------
+            serializable_segments = {
+                key: list(value) if isinstance(value, (set, list)) else value
+                for key, value in self.user_segments.items()
+            }
+
+            with open(
+                self.cache_dir / "user_segments.json",
+                "w",
+                encoding="utf-8",
+            ) as f:
                 json.dump(serializable_segments, f)
-    
-            # Save dataframes
+
+            # ------------------------------------------------------------
+            # Popularity tables
+            # ------------------------------------------------------------
             if self.product_popularity is not None:
                 self.product_popularity.write_parquet(
-                    self.cache_dir / 'product_popularity.parquet'
+                    self.cache_dir / "product_popularity.parquet"
                 )
+
             if self.category_popularity is not None:
                 self.category_popularity.write_parquet(
-                    self.cache_dir / 'category_popularity.parquet'
+                    self.cache_dir / "category_popularity.parquet"
                 )
-    
-            # Save SKU properties dict
-            with open(self.cache_dir / 'sku_properties_dict.pkl', 'wb') as f:
-                pickle.dump(self.sku_properties_dict, f)
-    
-            self.logger.info("Calculated data saved to cache.")
-        except Exception as e:
-            self.logger.error(f"Failed to save calculated data: {e}", exc_info=True)
 
-    def _load_calculated_data_from_cache(self) -> bool:
-            if not self.cache_dir:
+            # ------------------------------------------------------------
+            # SKU properties used by text formatting
+            # ------------------------------------------------------------
+            with open(
+                self.cache_dir / "sku_properties_dict.pkl",
+                "wb",
+            ) as f:
+                pickle.dump(self.sku_properties_dict, f)
+
+            # ------------------------------------------------------------
+            # Graph-derived centralities
+            # ------------------------------------------------------------
+            with open(
+                self.cache_dir / "sku_centrality.pkl",
+                "wb",
+            ) as f:
+                pickle.dump(getattr(self, "sku_centrality", {}), f)
+
+            with open(
+                self.cache_dir / "cat_centrality.pkl",
+                "wb",
+            ) as f:
+                pickle.dump(getattr(self, "cat_centrality", {}), f)
+
+            self.logger.info("Calculated Retailrocket data saved to cache.")
+
+        except Exception as exc:
+            self.logger.error(
+                f"Failed to save calculated Retailrocket data: {exc}",
+                exc_info=True,
+            )
+
+    def _load_calculated_data_from_cache(
+        self,
+        expected_reference_time: Optional[datetime] = None,
+    ) -> bool:
+        """
+        Load derived statistics for a full Retailrocket run.
+
+        This cache is intentionally only reused for runs without an
+        observation cutoff. Temporal-split runs must recompute their
+        statistics from the observation history to avoid leakage.
+        """
+        if not self.cache_dir:
+            return False
+
+        required_files = [
+            self.cache_dir / "retailrocket_cache_metadata.json",
+            self.cache_dir / "global_stats.json",
+            self.cache_dir / "user_segments.json",
+            self.cache_dir / "product_popularity.parquet",
+            self.cache_dir / "category_popularity.parquet",
+            self.cache_dir / "sku_properties_dict.pkl",
+            self.cache_dir / "sku_centrality.pkl",
+            self.cache_dir / "cat_centrality.pkl",
+        ]
+
+        missing_files = [
+            path.name for path in required_files if not path.exists()
+        ]
+
+        if missing_files:
+            self.logger.info(
+                "Derived Retailrocket cache incomplete; recomputing. "
+                f"Missing: {', '.join(missing_files)}"
+            )
+            return False
+
+        try:
+            # ------------------------------------------------------------
+            # Validate metadata
+            # ------------------------------------------------------------
+            with open(
+                self.cache_dir / "retailrocket_cache_metadata.json",
+                "r",
+                encoding="utf-8",
+            ) as f:
+                metadata = json.load(f)
+
+            if metadata.get("cache_version") != "retailrocket_full_v1":
+                self.logger.info(
+                    "Retailrocket cache version does not match; recomputing."
+                )
                 return False
-            all_loaded = True
-            try:
-                try:
-                    with open(self.cache_dir / 'global_stats.json','r') as f:
-                        self.global_stats = json.load(f)
-                except Exception:
-                    self.logger.warning("Cache miss: global_stats.json")
-                    self.global_stats = {}
-                    all_loaded = False
-                    
-                try:
-                    with open(self.cache_dir / 'user_segments.json','r') as f:
-                        self.user_segments = json.load(f)
-                except Exception:
-                    self.logger.warning("Cache miss: user_segments.json")
-                    self.user_segments = {}
-                    all_loaded = False
-                    
-                try:
-                    self.product_popularity = pl.read_parquet(
-                        self.cache_dir / 'product_popularity.parquet'
+
+            if expected_reference_time is not None:
+                expected_iso = expected_reference_time.isoformat()
+                cached_reference_time = metadata.get("reference_time")
+
+                if cached_reference_time != expected_iso:
+                    self.logger.info(
+                        "Retailrocket cache reference time does not match "
+                        "the current full run; recomputing."
                     )
-                except Exception:
-                    self.logger.warning("Cache miss: product_popularity.parquet")
-                    self.product_popularity = None
-                    all_loaded = False
-                    
-                try:
-                    self.category_popularity = pl.read_parquet(
-                        self.cache_dir / 'category_popularity.parquet'
-                    )
-                except Exception:
-                    self.logger.warning("Cache miss: category_popularity.parquet")
-                    self.category_popularity = None
-                    
-                try:
-                    filtered_pkl = self.cache_dir / 'sku_properties_dict_filtered.pkl'
-                    full_pkl = self.cache_dir / 'sku_properties_dict.pkl'
-                    
-                    if filtered_pkl.exists():
-                        with open(filtered_pkl, 'rb') as f:
-                            self.sku_properties_dict = pickle.load(f)
-                        self.logger.info(f"Loaded FILTERED {len(self.sku_properties_dict)} SKU properties")
-                    else:
-                        with open(full_pkl, 'rb') as f:
-                            self.sku_properties_dict = pickle.load(f)
-                        self.logger.info(f"Loaded FULL {len(self.sku_properties_dict)} SKU properties")
-                except Exception:
-                    self.logger.warning("Cache miss: sku_properties_dict.pkl")
-                    self.sku_properties_dict = {}
-                    all_loaded = False
-                    
-                # ✅ FIX : J'ai SUPPRIMÉ le bloc problématique qui utilisait relevant_client_ids
-                # Le filtrage des SKU doit se faire dans load_data(), pas ici !
-                        
-                if all_loaded:
-                    self.logger.info("Loaded calculated data from cache.")
-            except Exception as e:
-                self.logger.error(f"Error loading cache: {e}")
-                all_loaded = False
-            return all_loaded
+                    return False
+
+            # ------------------------------------------------------------
+            # Restore global statistics and segments
+            # ------------------------------------------------------------
+            with open(
+                self.cache_dir / "global_stats.json",
+                "r",
+                encoding="utf-8",
+            ) as f:
+                self.global_stats = json.load(f)
+
+            # rfm_recencies must be NumPy again for the existing metric code.
+            if isinstance(self.global_stats.get("rfm_recencies"), list):
+                self.global_stats["rfm_recencies"] = np.array(
+                    self.global_stats["rfm_recencies"],
+                    dtype=int,
+                )
+
+            with open(
+                self.cache_dir / "user_segments.json",
+                "r",
+                encoding="utf-8",
+            ) as f:
+                self.user_segments = json.load(f)
+
+            # ------------------------------------------------------------
+            # Restore popularity tables
+            # ------------------------------------------------------------
+            self.product_popularity = pl.read_parquet(
+                self.cache_dir / "product_popularity.parquet"
+            )
+
+            self.category_popularity = pl.read_parquet(
+                self.cache_dir / "category_popularity.parquet"
+            )
+
+            # ------------------------------------------------------------
+            # Restore SKU properties and graph centralities
+            # ------------------------------------------------------------
+            with open(
+                self.cache_dir / "sku_properties_dict.pkl",
+                "rb",
+            ) as f:
+                self.sku_properties_dict = pickle.load(f)
+
+            with open(
+                self.cache_dir / "sku_centrality.pkl",
+                "rb",
+            ) as f:
+                self.sku_centrality = pickle.load(f)
+
+            with open(
+                self.cache_dir / "cat_centrality.pkl",
+                "rb",
+            ) as f:
+                self.cat_centrality = pickle.load(f)
+
+            # Keep both names available because existing helper methods use
+            # both attribute spellings.
+            self.category_centrality = self.cat_centrality
+
+            # ------------------------------------------------------------
+            # Rebuild in-memory popularity lookup used by RAW_SEQUENCE POP_Q
+            # ------------------------------------------------------------
+            global POP_QUANT_EDGES
+
+            if (
+                self.product_popularity is not None
+                and "popularity_score" in self.product_popularity.columns
+            ):
+                scores = (
+                    self.product_popularity["popularity_score"]
+                    .drop_nulls()
+                    .to_numpy()
+                )
+
+                if scores.size > 0:
+                    POP_QUANT_EDGES = [
+                        float(np.quantile(scores, quantile))
+                        for quantile in (0.25, 0.50, 0.75)
+                    ]
+
+                self.pop_score_by_sku = {
+                    int(row["sku"]): float(row["popularity_score"])
+                    for row in self.product_popularity
+                    .select(["sku", "popularity_score"])
+                    .iter_rows(named=True)
+                    if row["sku"] is not None
+                    and row["popularity_score"] is not None
+                }
+
+            self.logger.info(
+                "Loaded derived Retailrocket statistics and centralities "
+                "from cache."
+            )
+            return True
+
+        except Exception as exc:
+            self.logger.warning(
+                f"Unable to restore Retailrocket derived cache: {exc}. "
+                "Recomputing statistics."
+            )
+            return False
 
     # ------------------------------------------------------------------ #
     # _compute_global_statistics (lazy-accelerated)                     #
@@ -2624,7 +2539,7 @@ class AdvancedUBMGenerator:
               .agg(pl.max('timestamp').alias('last_purchase_ts'))
         )
         df = recs_lf.collect(engine='streaming')
-        now_ts = datetime.now()
+        now_ts = self.reference_time or datetime.now()
         recs = [ (now_ts - row['last_purchase_ts']).days 
                  for row in df.to_dicts() if row['last_purchase_ts']]
         self.global_stats['rfm_recencies'] = np.array(recs, dtype=int)
@@ -2717,13 +2632,16 @@ class AdvancedUBMGenerator:
               )
         ).collect(engine='streaming')
         
-        stats = df.group_by("sid").agg([
+        stats = df.group_by(["client_id", "sid"]).agg([
             pl.col("timestamp").min().alias("start"),
             pl.col("timestamp").max().alias("end"),
-            pl.col("sid").count().alias("count")  # Utiliser pl.col().count()
+            pl.len().alias("count")
         ]).with_columns(
-            ((pl.col("end")-pl.col("start")).dt.total_seconds()/60).alias("duration_min")
+            (
+                (pl.col("end") - pl.col("start")).dt.total_seconds() / 60
+            ).alias("duration_min")
         )
+        
         
         if stats.height>0:
             agg = stats.select([
@@ -2818,84 +2736,6 @@ class AdvancedUBMGenerator:
         
         self.category_popularity = df
         self.logger.info(f"Computed category popularity for {df.height} categories.")
-    # ------------------------------------------------------------------ #
-    # ------------------------------------------------------------------ #
-    # === Lazy-aware Helpers for Global Computations ==================== #
-    # ------------------------------------------------------------------ #
-
-    def _build_category_centrality(self) -> None:
-        """
-        Builds a directed graph Cat_i→Cat_j from successive page_visit or product_buy events,
-        computes PageRank, all via lazy Polars to avoid full materialization.
-        """
-        if self.lazy_all is None:
-            self.cat_centrality = {}
-            return
-        # collect only category transitions
-        df = (
-            self.lazy_all
-              .filter(pl.col('category_id').is_not_null())
-              .select(['client_id','timestamp','category_id'])
-              .sort(['client_id','timestamp'])
-              .with_columns(
-                  pl.col('category_id').shift(-1).over('client_id').alias('next_cat')
-              )
-              .filter(pl.col('next_cat').is_not_null())
-              .select(['category_id','next_cat'])
-        ).collect(engine='streaming')
-
-        # build graph
-        G = nx.DiGraph()
-        for row in df.iter_rows(named=True):
-            src, dst = int(row['category_id']), int(row['next_cat'])
-            if src == dst:
-                continue
-            if G.has_edge(src, dst):
-                G[src][dst]['weight'] += 1
-            else:
-                G.add_edge(src, dst, weight=1)
-        if G.number_of_nodes() == 0:
-            self.cat_centrality = {}
-            self.logger.info("Category centrality skipped (empty graph).")
-            return
-        # PageRank
-        pr = nx.pagerank(G, weight='weight', max_iter=100, tol=1e-4)
-        self.cat_centrality = pr
-        self.logger.info(
-            f"Built centrality maps  • SKU:{len(getattr(self,'sku_centrality',{}))}  • CAT:{len(pr)}"
-        )
-
-    def _compute_global_co_occurrences(self, session_gap: int = 30) -> None:
-        """
-        Counts co-occurring SKU and category pairs within user sessions (lazy + collect small slice).
-        """
-        if self.lazy_all is None:
-            return
-        # collect relevant events
-        df = (
-            self.lazy_all
-              .filter(pl.col('event_type').is_in(['product_buy','add_to_cart','page_visit']))
-              .select(['client_id','timestamp','sku','category_id'])
-              .sort(['client_id','timestamp'])
-        ).collect(engine='streaming')
-        # identify sessions
-        diff = df['timestamp'].diff().dt.total_seconds() / 60
-        df = df.with_columns(((diff.is_null()) | (diff > session_gap)).cum_sum().alias('sess_id'))
-        sku_pairs = Counter()
-        cat_pairs = Counter()
-        from itertools import combinations
-        for (_cid, sess), sub in df.group_by(['client_id','sess_id']):
-            skus = sub['sku'].drop_nulls().unique().to_list()
-            cats = sub['category_id'].drop_nulls().unique().to_list()
-            for i,j in combinations(sorted(set(skus)),2):
-                sku_pairs[(int(i),int(j))] += 1
-            for c1,c2 in combinations(sorted(set(cats)),2):
-                cat_pairs[(int(c1),int(c2))] += 1
-        self.global_stats['global_sku_pairs'] = dict(sku_pairs)
-        self.global_stats['global_cat_pairs'] = dict(cat_pairs)
-        self.logger.info(
-            f"Global co-occurrences  SKU_pairs:{len(sku_pairs)}  CAT_pairs:{len(cat_pairs)}"
-        )
 
     # ------------------------------------------------------------------
     # Segmentation principale : acheteurs / navigateurs actifs, etc.
@@ -2928,7 +2768,7 @@ class AdvancedUBMGenerator:
               .fill_null(0)
         )
         # ensure all event-type cols exist
-        for c in ['page_visit','product_buy','add_to_cart','search_query']:
+        for c in ["page_visit", "product_buy", "add_to_cart"]:
             if c not in df_counts.columns:
                 df_counts = df_counts.with_columns(pl.lit(0).alias(c))
     
@@ -2948,7 +2788,7 @@ class AdvancedUBMGenerator:
             max_ts = datetime.now()
     
         # **Plus besoin de collect(engine='streaming') ici : df est déjà un DataFrame**
-        now = datetime.now()
+        now = self.reference_time or max_ts
         df = df.with_columns([
             pl.Series(
                 "days_since_run",
@@ -2994,162 +2834,180 @@ class AdvancedUBMGenerator:
     
         self.user_segments = segs
     
-        # 7) Further sub-segmentation
+        # Additional Retailrocket-compatible category segmentation.
         try:
-            self._segment_users_by_price_sensitivity(df)
             self._segment_users_by_category_behavior(df)
-        except Exception as e:
-            self.logger.error(f"Err price/cat segmentation: {e}")
+        except Exception as exc:
+            self.logger.error(f"Err category segmentation: {exc}")
     
         self.logger.info(
             f"User segmentation done: Buyers={len(segs['buyers'])}, "
             f"Active relative buyers={len(segs['active_buyers_relative'])}"
         )
 
-    def _segment_users_by_price_sensitivity(self, user_counts: pl.DataFrame) -> None:
+    def _segment_users_by_category_behavior(
+        self,
+        df: pl.DataFrame,
+    ) -> None:
         """
-        Splits users into price sensitivity segments based on avg add_to_cart vs purchase price buckets,
-        computed lazily to avoid full event tables in memory.
+        Add Retailrocket-compatible category-behavior segments.
+
+        Users are classified according to the concentration of their observed
+        category interactions:
+        - category_loyal: activity strongly concentrated on one category
+        - category_explorer: activity spread across several categories
+        - moderate_explorer: intermediate behavior
         """
         if self.lazy_all is None:
             return
-        try:
-            # compute avg price for cart and buy per user
-            price_lf = (
-                self.lazy_all
-                  .filter(pl.col('price_bucket').is_not_null() & pl.col('event_type').is_in(['add_to_cart','product_buy']))
-                  .group_by(['client_id','event_type'])
-                  .agg(pl.mean('price_bucket').alias('avg_price'))
-            ).collect(engine='streaming')
-            price_lf = price_lf.pivot(index='client_id', columns='event_type', values='avg_price', aggregate_function='first')
-            df_price = user_counts.select('client_id').join(price_lf, on='client_id', how='left').fill_null(0)
-            if 'add_to_cart' not in df_price.columns or 'product_buy' not in df_price.columns:
-                return
 
-            df_price = df_price.with_columns(
-                (pl.when(pl.col('add_to_cart')>0)
-                   .then(pl.col('product_buy')/pl.col('add_to_cart'))
-                   .otherwise(None)
-                 ).alias('sensitivity_ratio')
+        category_counts = (
+            self.lazy_all
+            .filter(pl.col("category_id").is_not_null())
+            .group_by(["client_id", "category_id"])
+            .agg(pl.len().alias("category_events"))
+            .collect(engine="streaming")
+        )
+
+        if category_counts.is_empty():
+            self.user_segments["category_loyal"] = []
+            self.user_segments["moderate_explorer"] = []
+            self.user_segments["category_explorer"] = []
+            return
+
+        category_summary = (
+            category_counts
+            .group_by("client_id")
+            .agg([
+                pl.col("category_events").sum().alias("total_category_events"),
+                pl.col("category_events").max().alias("top_category_events"),
+                pl.len().alias("unique_categories"),
+            ])
+            .with_columns(
+                (
+                    pl.col("top_category_events")
+                    / pl.col("total_category_events")
+                ).alias("top_category_share")
             )
-            valid = df_price.filter(pl.col('sensitivity_ratio').is_not_null() & pl.col('sensitivity_ratio').is_finite())['sensitivity_ratio']
-            if valid.len() > 10:
-                low, high = valid.quantile(0.33), valid.quantile(0.66)
-                self.user_segments['price_sensitive'] = df_price.filter(pl.col('sensitivity_ratio') < low)['client_id'].to_list()
-                self.user_segments['price_moderate'] = df_price.filter((pl.col('sensitivity_ratio') >= low) & (pl.col('sensitivity_ratio') <= high))['client_id'].to_list()
-                self.user_segments['price_insensitive'] = df_price.filter(pl.col('sensitivity_ratio') > high)['client_id'].to_list()
-                self.logger.info(
-                    f"Price segmentation: Sens={len(self.user_segments['price_sensitive'])}, "
-                    f"Mod={len(self.user_segments['price_moderate'])}, "
-                    f"Insens={len(self.user_segments['price_insensitive'])}"
+        )
+
+        category_loyal = (
+            category_summary
+            .filter(pl.col("top_category_share") >= 0.75)
+            ["client_id"]
+            .to_list()
+        )
+
+        category_explorer = (
+            category_summary
+            .filter(
+                (pl.col("top_category_share") < 0.40)
+                & (pl.col("unique_categories") >= 3)
+            )
+            ["client_id"]
+            .to_list()
+        )
+
+        moderate_explorer = (
+            category_summary
+            .filter(
+                (pl.col("top_category_share") < 0.75)
+                & ~(
+                    (pl.col("top_category_share") < 0.40)
+                    & (pl.col("unique_categories") >= 3)
                 )
-        except Exception as e:
-            self.logger.error(f"Err price segmentation: {e}")
-
-    def _segment_users_by_category_behavior(self, user_counts: pl.DataFrame) -> None:
-        """
-        Classifies users into category loyalty/exploration segments based on distribution of page_visit counts,
-        all computed on a small collected slice.
-        """
-        if self.lazy_all is None:
-            return
-        try:
-            # 1) Count page visits by category per user
-            cat_lf = (
-                self.lazy_all
-                  .filter((pl.col('event_type')=='page_visit') & pl.col('category_id').is_not_null())
-                  .group_by(['client_id','category_id'])
-                  .agg(pl.count().alias('view_count'))
             )
-            df_cat = cat_lf.collect(engine='streaming')
-            if df_cat.height == 0:
-                return
+            ["client_id"]
+            .to_list()
+        )
 
-            # 2) Aggregate per user: total views, max in one category, num categories
-            user_cat = (
-                df_cat
-                  .group_by('client_id')
-                  .agg(
-                      pl.sum('view_count').alias('total_views'),
-                      pl.max('view_count').alias('max_views_in_one_cat'),
-                      pl.count().alias('n_cats')
-                  )
-                  .with_columns(
-                      (pl.col('max_views_in_one_cat')/pl.col('total_views')).alias('category_loyalty_score')
-                  )
-            )
+        self.user_segments["category_loyal"] = category_loyal
+        self.user_segments["moderate_explorer"] = moderate_explorer
+        self.user_segments["category_explorer"] = category_explorer
 
-            # 3) Join with full user list
-            df_stats = user_counts.select('client_id').join(user_cat, on='client_id', how='left').fill_null(0)
-
-            # Thresholds
-            loyal_thresh = 0.75
-            explorer_thresh = 0.40
-
-            # 4) Assign segments
-            self.user_segments['category_loyal'] = (
-                df_stats.filter(pl.col('category_loyalty_score') >= loyal_thresh)['client_id'].to_list()
-            )
-            self.user_segments['category_explorer'] = (
-                df_stats.filter((pl.col('category_loyalty_score') <= explorer_thresh) & (pl.col('n_cats') >= 3))['client_id'].to_list()
-            )
-            self.user_segments['moderate_explorer'] = (
-                df_stats.filter((pl.col('category_loyalty_score') > explorer_thresh) & (pl.col('category_loyalty_score') < loyal_thresh))['client_id'].to_list()
-            )
-
-            self.logger.info(
-                f"Category segmentation: Loyal={len(self.user_segments['category_loyal'])}, "
-                f"Moderate={len(self.user_segments['moderate_explorer'])}, "
-                f"Explorer={len(self.user_segments['category_explorer'])}"
-            )
-        except Exception as e:
-            self.logger.error(f"Err category segmentation: {e}")
-
-
+        self.logger.info(
+            "Category segmentation: Loyal=%d, Moderate=%d, Explorer=%d",
+            len(category_loyal),
+            len(moderate_explorer),
+            len(category_explorer),
+        )
     # --- Getters ---
     def get_feature_extractors(self) -> Dict[str, FeatureExtractorBase]:
-        if not self._extractors:
+            """
+            Initialize feature extractors from the available Retailrocket schema.
+
+            Important:
+            In normal/full-run mode we keep the data lazy and do not materialize
+            the complete event table into self.events_df. Therefore extractor
+            activation must be based on the lazy schema whenever possible.
+            """
+            if self._extractors:
+                return self._extractors
+
             self.logger.debug("Initializing feature extractors...")
-            self._extractors = {}
-            self._extractors['temporal'] = TemporalFeatureExtractor(self)
-            self._extractors['sequence'] = SequenceFeatureExtractor(self)
-            self._extractors['churn_propensity'] = ChurnPropensityFeatureExtractor(self)
-            if self.top_skus:
-                self._extractors['top_sku'] = TopSKUFeatureExtractor(self)
-            if self.top_categories:
-                self._extractors['top_category'] = TopCategoryFeatureExtractor(self)
 
-            if self.events_df is not None:
-                if 'category_id' in self.events_df.columns or 'sku' in self.events_df.columns:
-                    self._extractors['graph'] = GraphFeatureExtractor(self)
-                if 'query' in self.events_df.columns:
-                    self._extractors['intent'] = IntentFeatureExtractor(self)
-                if 'price_bucket' in self.events_df.columns:
-                    self._extractors['price'] = PriceFeatureExtractor(self)
-                if self.product_popularity is not None:
-                    self._extractors['social'] = SocialFeatureExtractor(self)
-                if self.sku_properties_dict:
-                    self._extractors['name_embedding'] = NameEmbeddingExtractor(self)
-                if hasattr(self, 'sku_cluster_map'):
-                    self._extractors['custom_behavior'] = CustomBehaviorFeatureExtractor(self)
+            self._extractors = {
+                "temporal": TemporalFeatureExtractor(self),
+                "sequence": SequenceFeatureExtractor(self),
+                "churn_propensity": ChurnPropensityFeatureExtractor(self),
+            }
 
-            self.logger.info(f"Initialized extractors: {list(self._extractors.keys())}")
-        return self._extractors
+            # Determine available columns without forcing complete materialization.
+            if self.lazy_all is not None:
+                available_columns = set(self.lazy_all.collect_schema().names())
+            elif self.events_df is not None:
+                available_columns = set(self.events_df.columns)
+            else:
+                available_columns = set()
+
+            if "category_id" in available_columns or "sku" in available_columns:
+                self._extractors["graph"] = GraphFeatureExtractor(self)
+
+            # Retailrocket supports view/cart/purchase funnel and cart-behavior
+            # features, but provides no search-query events.
+            if "event_type" in available_columns:
+                self._extractors["intent"] = IntentFeatureExtractor(self)
+
+            if "is_available" in available_columns:
+                self._extractors["availability"] = AvailabilityFeatureExtractor(self)
+
+            if self.product_popularity is not None:
+                self._extractors["social"] = SocialFeatureExtractor(self)
+
+            if (
+                self.product_popularity is not None
+                and self.category_popularity is not None
+            ):
+                self._extractors["retailrocket_global_popularity"] = (
+                    RetailrocketGlobalPopularityFeatureExtractor(self)
+                )
+
+            self.logger.info(
+                f"Initialized extractors: {list(self._extractors.keys())}"
+            )
+
+            return self._extractors
 
 
     def get_client_events(self, client_id: int) -> pl.DataFrame:
-        """Ne charge que les events d'UN client"""
-        # PRIORITÉ au mode streaming
+        """
+        Return all loaded Retailrocket history events for one client.
+
+        The preferred path reads from the lazy Retailrocket event pipeline.
+        In debug mode, a previously materialized test subset may be used.
+        """
         if self.lazy_all is not None:
             return self._collect_client_events(client_id)
-        # Fallback si pas de lazy pipeline
-        elif self.events_df is not None:
-            return self.events_df.filter(pl.col('client_id') == client_id)
-        # Dernier recours : scan direct
-        else:
-            return pl.scan_parquet(self.cache_dir / "events_1m_clients.parquet")\
-                     .filter(pl.col('client_id') == client_id)\
-                     .collect()
+
+        if self.events_df is not None:
+            return self.events_df.filter(
+                pl.col("client_id") == client_id
+            )
+
+        raise RuntimeError(
+            "No Retailrocket event pipeline is available. "
+            "Call load_data() before generating representations."
+        )
 
 
 
@@ -3162,20 +3020,49 @@ class AdvancedUBMGenerator:
 
     # --- Multi-Resolution History Helpers ---
     def _format_event_for_history(self, event_row: Dict[str, Any]) -> str:
-        event_type = event_row.get("event_type"); sku = event_row.get("sku"); url = event_row.get("url")
-        query = event_row.get("query"); ts = event_row.get("timestamp")
-        ts_str = ts.strftime('%Y%m%d-%H%M') if isinstance(ts, datetime) else "NT" # Format plus court
-        text_parts = [f"[{ts_str}] E:{event_type or '?'}"]
+        """Format one Retailrocket interaction for the recent-history section."""
+        event_type = event_row.get("event_type")
+        sku = event_row.get("sku")
+        timestamp = event_row.get("timestamp")
+
+        timestamp_text = (
+            timestamp.strftime("%Y%m%d-%H%M")
+            if isinstance(timestamp, datetime)
+            else "NT"
+        )
+
+        text_parts = [f"[{timestamp_text}] E:{event_type or '?'}"]
+
+        if sku is None:
+            return "".join(text_parts)
+
         try:
-            if sku is not None:
-                sku_int = int(sku); text_parts.append(f" S:{sku_int}")
-                props = self.sku_properties_dict.get(sku_int, {})
-                if props.get('category') is not None: text_parts.append(f" C:{props['category']}")
-                if props.get('price') is not None: text_parts.append(f" P:{props['price']}")
-            elif url is not None: text_parts.append(f" U:{url}")
-            elif query is not None: text_parts.append(f" Q:{hash(str(query))%10000:04d}") # Hash court pour Q
-        except Exception: pass # Ignorer erreurs de formatage individuelles
+            sku_int = int(sku)
+            text_parts.append(f" S:{sku_int}")
+
+            category_id = event_row.get("category_id")
+            if category_id is None:
+                category_id = self.sku_properties_dict.get(
+                    sku_int, {}
+                ).get("category")
+
+            if category_id is not None:
+                text_parts.append(f" C:{int(category_id)}")
+
+            is_available = event_row.get("is_available")
+            if is_available is not None:
+                text_parts.append(
+                    f" A:{'IN' if int(is_available) == 1 else 'OUT'}"
+                )
+
+        except (TypeError, ValueError):
+            self.logger.debug(
+                "Unable to format Retailrocket history event: %s",
+                event_row,
+            )
+
         return "".join(text_parts)
+
 
     def _generate_detailed_events_text(self, client_events: pl.DataFrame, limit=30) -> str:
         if client_events.height == 0: return "No recent activity."
@@ -3183,17 +3070,58 @@ class AdvancedUBMGenerator:
         event_texts = [self._format_event_for_history(row) for row in recent_events_rows]
         return "\n".join(filter(None, event_texts))
 
-    def _generate_summarized_events_text(self, client_events: pl.DataFrame, limit=10) -> str:
-        if client_events.height == 0: return "No medium-term activity."
-        summary = [f"Event count: {client_events.height}"]
-        event_counts = client_events.group_by('event_type').agg(pl.count().alias('count')).sort('count', descending=True)
-        summary.append("Event Types: " + ", ".join([f"{row['event_type']}:{row['count']}" for row in event_counts.iter_rows(named=True)]))
-        if 'category_id' in client_events.columns:
-            purchases = client_events.filter((pl.col('event_type') == pl.lit('product_buy', dtype=pl.Categorical)) & pl.col('category_id').is_not_null())
+    def _generate_summarized_events_text(
+        self,
+        client_events: pl.DataFrame,
+        limit: int = 10,
+    ) -> str:
+        """Summarize interactions from the medium-term sequence window."""
+        if client_events.height == 0:
+            return "No medium-term activity."
+
+        summary = [
+            f"Sequence-window event count: {client_events.height}"
+        ]
+
+        event_counts = (
+            client_events
+            .group_by("event_type")
+            .agg(pl.len().alias("count"))
+            .sort("count", descending=True)
+        )
+
+        summary.append(
+            "Sequence-window event types: "
+            + ", ".join(
+                f"{row['event_type']}:{row['count']}"
+                for row in event_counts.iter_rows(named=True)
+            )
+        )
+
+        if "category_id" in client_events.columns:
+            purchases = client_events.filter(
+                (pl.col("event_type") == pl.lit("product_buy", dtype=pl.Categorical))
+                & pl.col("category_id").is_not_null()
+            )
+
             if purchases.height > 0:
-                category_counts = purchases.group_by('category_id').agg(pl.count().alias('count')).sort('count', descending=True)
+                category_counts = (
+                    purchases
+                    .group_by("category_id")
+                    .agg(pl.len().alias("count"))
+                    .sort("count", descending=True)
+                )
+
                 top_cats = category_counts.head(limit).to_dicts()
-                summary.append("Top Purchased Cats: " + ", ".join([f"[CAT_{c['category_id']}]:{c['count']}" for c in top_cats]))
+
+                summary.append(
+                    "Sequence-window top purchased categories: "
+                    + ", ".join(
+                        f"[CAT_{row['category_id']}]:{row['count']}"
+                        for row in top_cats
+                    )
+                )
+
         return "\n".join(summary)
 
     def _generate_aggregated_events_text(self, client_events: pl.DataFrame) -> str:
@@ -3220,25 +3148,22 @@ class AdvancedUBMGenerator:
 
         props = self.sku_properties_dict.get(int(sku), {}) if sku is not None else {}
         etype = event_row['event_type']
-        if etype in ('product_buy', 'add_to_cart', 'remove_from_cart') and sku is not None:
+        if etype in ('page_visit', 'add_to_cart', 'product_buy') and sku is not None:
             parts.append(f"SKU:[SKU_{int(sku)}]")
-            if etype != 'remove_from_cart':
-                cat = props.get('category'); price = props.get('price')
-                if cat is not None: parts.append(f"CAT:[CAT_{cat}]")
-                if price is not None: parts.append(f"PRICE:[PRICE_{price}]")
-            name_emb = props.get('name')
-            if isinstance(name_emb, str) and name_emb.startswith('[') and name_emb.endswith(']'):
-                clean = name_emb.strip('[]').replace(',', ' ')
-                parts.append(f"NAME_EMB:[{clean}]")
-        elif etype == 'page_visit' and event_row.get('url'):
-            parts.append(f"URL:[URL_{event_row['url']}]" )
-        elif etype == 'search_query' and event_row.get('query'):
-            q = event_row['query']
-            if isinstance(q, str) and q.startswith('[') and q.endswith(']'):
-                clean = q.strip('[]').replace(',', ' ')
-                parts.append(f"QUERY_EMB:[{clean}]")
-            else:
-                parts.append("QUERY_EMB:[InvalidFormat]")
+
+            cat = event_row.get('category_id')
+            if cat is None:
+                cat = props.get('category')
+            if cat is not None:
+                parts.append(f"CAT:[CAT_{int(cat)}]")
+
+            is_available = event_row.get("is_available")
+            if is_available is not None:
+                availability_token = (
+                    "IN_STOCK" if int(is_available) == 1 else "OUT_OF_STOCK"
+                )
+                parts.append(f"AVAIL:[{availability_token}]")
+
         if hasattr(self, 'pop_score_by_sku') and self.pop_score_by_sku:
             score = self.pop_score_by_sku.get(sku_int)
             q_tag = pop_bin(score)
@@ -3246,7 +3171,8 @@ class AdvancedUBMGenerator:
         # --- NEW: how-many-days-ago bucket (coarse) ------------------
         if ts := event_row.get('timestamp'):
             if isinstance(ts, datetime):
-                days_ago = (datetime.now() - ts).days
+                reference_time = self.reference_time or datetime.now()
+                days_ago = (reference_time - ts).days
                 if   days_ago <= 1:      parts.append("AGE:[D_0-1]")
                 elif days_ago <= 7:      parts.append("AGE:[D_1-7]")
                 elif days_ago <= 30:     parts.append("AGE:[D_7-30]")
@@ -3299,131 +3225,75 @@ class AdvancedUBMGenerator:
 
         return SEP_TOKEN.join(seq_tokens)    
     
+
+    def _shannon_entropy(self, counter: Counter) -> float:
+        """Return Shannon entropy in bits for observed categorical values."""
+        total = sum(counter.values())
+
+        if total == 0:
+            return 0.0
+
+        return -sum(
+            (count / total) * log2(count / total)
+            for count in counter.values()
+            if count > 0
+        )
     def _compute_compact_metrics(self, events: pl.DataFrame) -> list[str]:
         """
-        Renvoie des tags compacts (≤10 tokens chacun) :
-          NAME_STD, Δ$, BURST, CAT_PR_TOP, H_cat, H_price
-        S'adapte aux schémas avec event_type / price_bucket / emb_str.
+        Return compact Retailrocket-compatible behavioral metrics.
+
+        Retailrocket supports behavioral timestamps and categories, but the
+        current pipeline does not expose validated prices or product-name
+        embeddings.
         """
-        tags = []
-        
-        # ---------- helpers internes -------------------------------------------
-        evt_col   = "event_type" if "event_type" in events.columns else "event"
-        price_col = "price" if "price" in events.columns else "price_bucket"
-        
-        def _bucket_to_num(s: pl.Series) -> np.ndarray:
-            """Convertit price_bucket en valeurs numériques, en gérant les nulls"""
-            if s.dtype == pl.Int64 or s.dtype == pl.Float64:
-                return s.to_numpy()
-            
-            # Filtrer les nulls avant d'appliquer str.replace
-            if s.null_count() > 0:
-                # Option 1: Remplacer les nulls par une valeur par défaut
-                s = s.fill_null("0")
-            
-            # Maintenant on peut appliquer str.replace en toute sécurité
-            return s.str.replace(r"[^0-9]", "").cast(pl.Int32, strict=False).fill_null(0).to_numpy()
-        
-        # ---------- NAME_STD ----------------------------------------------------
-        emb = None
-        if "name_embedding" in events.columns:
-            emb = np.vstack([vec for vec in events["name_embedding"].to_list() if vec is not None])
-        elif "emb_str" in events.columns:
-            str_vecs = [
-                v for v in events["emb_str"].to_list()
-                if v is not None and isinstance(v, (str, bytes)) and v.strip()
-            ]
-            if str_vecs:
-                parsed_vecs = []
-                for v in str_vecs:
-                    try:
-                        clean_v = v.strip()
-                        if clean_v.startswith('[') and clean_v.endswith(']'):
-                            clean_v = clean_v[1:-1]
-                        vec = np.fromstring(clean_v, dtype=np.float32, sep=" ")
-                        if vec.size > 0 and np.all(np.isfinite(vec)):
-                            parsed_vecs.append(vec)
-                    except Exception:
-                        continue
-                
-                if parsed_vecs:
-                    try:
-                        emb = np.vstack(parsed_vecs)
-                    except Exception:
-                        emb = None
-        
-        if emb is not None and emb.size > 0:
+        tags: list[str] = []
+
+        # Activity concentration across hours.
+        if events.height > 0 and "timestamp" in events.columns:
             try:
-                if emb.dtype.kind in ['f', 'i', 'u']:
-                    name_std = round(float(np.std(emb)), 2)
-                    tags.append(f"NAME_STD:{name_std}")
-            except Exception:
-                pass
-        
-        # ---------- Δ Panier / Prix ---------------------------------------------
-        if price_col in events.columns:
-            buy_mask   = pl.col(evt_col) == "product_buy"
-            cart_mask  = pl.col(evt_col) == "add_to_cart"
-            
-            # Filtrer les événements avec prix non-null
-            buy_events = events.filter(buy_mask & pl.col(price_col).is_not_null())
-            cart_events = events.filter(cart_mask & pl.col(price_col).is_not_null())
-            
-            if buy_events.height > 0 and cart_events.height > 0:
-                buy_vals = _bucket_to_num(buy_events[price_col])
-                cart_vals = _bucket_to_num(cart_events[price_col])
-                
-                if buy_vals.size and cart_vals.size and cart_vals.mean() > 0:
-                    delta_pct = 100 * (buy_vals.mean() - cart_vals.mean()) / cart_vals.mean()
-                    tags.append(f"Δ$:{delta_pct:+.0f}%")
-        
-        # ---------- BURST score --------------------------------------------------
-        if events.height and "timestamp" in events.columns:
-            try:
-                hour_counts = np.bincount(events["timestamp"].dt.hour().fill_null(0).to_numpy(), minlength=24)
-                mu, var = hour_counts.mean(), hour_counts.var()
-                if mu > 0:
-                    tags.append(f"BURST:{round(var/mu,2)}")
-            except Exception:
-                pass
-        
-        # ---------- Graph centralité catégorie ----------------------------------
+                hour_counts = np.bincount(
+                    events["timestamp"]
+                    .dt.hour()
+                    .fill_null(0)
+                    .to_numpy(),
+                    minlength=24,
+                )
+                mean_count = hour_counts.mean()
+                variance = hour_counts.var()
+
+                if mean_count > 0:
+                    tags.append(f"BURST:{round(variance / mean_count, 2)}")
+
+            except Exception as exc:
+                self.logger.debug(f"Unable to compute BURST metric: {exc}")
+
+        # Centrality of the user's most central interacted category.
         if hasattr(self, "category_centrality") and "category_id" in events.columns:
-            cats = [c for c in events["category_id"].drop_nulls().to_list()
-                    if c in self.category_centrality]
-            if cats:
-                top_cat = max(cats, key=lambda c: self.category_centrality[c])
-                score = round(self.category_centrality[top_cat], 2)
-                tags.append(f"CAT_PR_TOP:{top_cat}({score})")
-        
-        # ---------- Entropies ----------------------------------------------------
-        from collections import Counter
-        
-        # Helper pour calculer l'entropie Shannon
-        def _shannon_entropy(counter: Counter) -> float:
-            n = sum(counter.values())
-            if n == 0:
-                return 0.0
-            from math import log2
-            return -sum((c / n) * log2(c / n) for c in counter.values() if c > 0)
-        
-        # Entropie des catégories
+            categories = [
+                category_id
+                for category_id in events["category_id"].drop_nulls().to_list()
+                if category_id in self.category_centrality
+            ]
+
+            if categories:
+                top_category = max(
+                    categories,
+                    key=lambda category_id: self.category_centrality[category_id],
+                )
+                score = round(self.category_centrality[top_category], 2)
+                tags.append(f"CAT_PR_TOP:{top_category}({score})")
+
+        # Entropy of category interactions.
         if "category_id" in events.columns:
-            cat_list = events["category_id"].drop_nulls().to_list()
-            if cat_list:
-                cat_entropy = _shannon_entropy(Counter(cat_list))
-                tags.append(f"H_cat:{round(cat_entropy,1)}")
-        
-        # Entropie des prix
-        if price_col in events.columns:
-            price_events = events.filter(pl.col(price_col).is_not_null())
-            if price_events.height > 0:
-                price_vals = _bucket_to_num(price_events[price_col])
-                price_vals = price_vals[price_vals > 0]  # Filtrer les 0
-                if price_vals.size > 0:
-                    price_entropy = _shannon_entropy(Counter(price_vals))
-                    tags.append(f"H_price:{round(price_entropy,1)}")
-        
+            category_values = events["category_id"].drop_nulls().to_list()
+
+            if category_values:
+                category_entropy = self._shannon_entropy(
+                    Counter(category_values)
+                )
+                
+                tags.append(f"H_cat:{round(category_entropy, 1)}")
+
         return tags
         
     def _compute_extra_short_metrics(
@@ -3686,7 +3556,7 @@ class AdvancedUBMGenerator:
         # ========================================================
         # GARDEZ TOUT LE CODE ORIGINAL À PARTIR D'ICI !
         # ========================================================
-        now = datetime.now()
+        now = self.reference_time or datetime.now()
         extractors = self.get_feature_extractors()
         reps: dict[int, str] = {}
         
@@ -3720,33 +3590,67 @@ class AdvancedUBMGenerator:
             section_map["OVERVIEW"].extend(overview_sec)
             features_json: list[dict[str, str]] = []
             features_list = []
+
+            # Additional compact behavioral metrics for the textual profile.
+            extra_tags = self._compute_extra_short_metrics(cid, events, now)
+            compact_tags = self._compute_compact_metrics(events)
             # where to dump each extractor's lines → logical section name
             ex_to_sec = {
-                "temporal":         "TEMPORAL",
-                "sequence":         "SEQUENCE",
-                "social":           "SOCIAL",
-                "price":            "PRICE",
-                "intent":           "OVERVIEW",  # can be changed to its own section
-                "graph":            "CUSTOM",
-                "name_embedding": "CUSTOM",
-                "custom_behavior":  "CUSTOM",
-                "top_sku":       "SKU_PROPENSITY",
-                "top_category":   "CAT_PROPENSITY",
+                "temporal": "TEMPORAL",
+                "sequence": "SEQUENCE",
+                "social": "SOCIAL",
+                "retailrocket_global_popularity": "GLOBAL_POPULARITY",
+                "availability": "AVAILABILITY",
+                "intent": "OVERVIEW",
+                "graph": "CUSTOM",
             }
-
             for ex_name, extractor in extractors.items():
-                tgt_sec = ex_to_sec.get(ex_name, "CUSTOM")
+                default_sec = ex_to_sec.get(ex_name, "CUSTOM")
+
                 try:
                     feats = extractor.extract_features(cid, events, now)
                 except Exception as err:
+                    self.logger.error(
+                        f"Feature extraction failed for {ex_name}, client {cid}: {err}"
+                    )
                     feats = [f"{ex_name}-error"]
 
-                # ↓↓↓  répétition implicite uniquement pour top_sku
-                repeat = IMPLICIT_WEIGHT_REPEAT if ex_name in ("top_sku", "top_category") else 1
                 for ft in feats:
-                    for _ in range(repeat):
-                        section_map[tgt_sec].append(ft)
-                    features_json.append({"type": ex_name, "value": ft})
+                    target_sec = default_sec
+
+                    # The churn_propensity extractor returns several logical
+                    # feature groups, so route them by their prefix.
+                    if ex_name == "churn_propensity":
+                        if ft.startswith((
+                            "CHURN_",
+                            "PURCHASE_RECENCY:",
+                            "PURCHASE_PATTERN:",
+                            "AVG_PURCHASE_INTERVAL:",
+                            "POST_PURCHASE",
+                        
+                        )):
+                            target_sec = "CHURN_PROPENSITY"
+
+                        elif ft.startswith((
+                            "CAT_PROPENSITY:",
+                            "CAT_EXPLORATION_BREADTH:",
+                            "PURCHASE_CAT_FOCUS:",
+                        )):
+                            target_sec = "CAT_PROPENSITY"
+
+                        elif ft.startswith((
+                            "SKU_PROPENSITY",
+                            "REPEAT_PURCHASE_SKUS:",
+                            "TOP_REPEAT_SKU:",
+                        )):
+                            target_sec = "SKU_PROPENSITY"
+
+                    section_map[target_sec].append(ft)
+
+                    features_json.append({
+                        "type": ex_name,
+                        "value": ft,
+                    })
             
             for t in extra_tags:
                 features_list.append({"type": "extra", "value": t})
@@ -3830,7 +3734,7 @@ class AdvancedUBMGenerator:
             )
 
             if recent_txt != "No recent activity.":
-                section_map["TARGET_WINDOW_14D"].append(recent_txt)
+                section_map["RECENT_HISTORY_14D"].append(recent_txt)
             if medium_txt != "No medium-term activity.":
                 section_map["SEQUENCE"].append(medium_txt)
             if hist_txt != "No historical activity.":
@@ -3839,15 +3743,13 @@ class AdvancedUBMGenerator:
             # ==============================================================
             # 5)  RAW SEQUENCE  -------------------------------------------
             # ==============================================================
+            # Keep the raw chronological event sequence separate from the
+            # shuffled feature sections. It is appended once after the rich
+            # profile text has been built.
             raw_seq = self._generate_raw_sequence(
-                events, max_events=RAW_SEQUENCE_LAST_EVENTS
+                events,
+                max_events=RAW_SEQUENCE_LAST_EVENTS,
             )
-            section_map["CUSTOM"].append("## RAW_SEQUENCE ##")
-            section_map["CUSTOM"].append("```")        # ← ouverture du bloc code
-            section_map["CUSTOM"].append(raw_seq)      # ← contenu brut
-            section_map["CUSTOM"].append("```")        # ← fermeture du bloc code
-            section_map["CUSTOM"].append("RAW_SEQUENCE (derniers 50 événements)…")
-            section_map["CUSTOM"].append("</s>".join(raw_seq.split("</s>")[-50:]))
 
             section_map["CUSTOM"] = list(dict.fromkeys(section_map["CUSTOM"]))
 
@@ -3856,12 +3758,12 @@ class AdvancedUBMGenerator:
             # ==============================================================
             try:
                 rich_text = _build_rich_text(
-                    section_map=section_map,
-                    max_tokens=max_length,
-                    implicit_repeat=IMPLICIT_WEIGHT_REPEAT,
-                    top_per_section=TOP_FEATURES_PER_SECTION,
-                    shuffle_seed=cid,
-                )
+                section_map=section_map,
+                max_tokens=max_length,
+                top_per_section=TOP_FEATURES_PER_SECTION,
+                shuffle_seed=cid,
+)
+                
             except Exception as exc:
                 self.logger.error(f"_build_rich_text failed for {cid}: {exc}")
                 # fallback – very plain
@@ -3991,18 +3893,6 @@ class ChurnPropensityFeatureExtractor(FeatureExtractorBase):
                     features.append("POST_PURCHASE:CART_ACTIVITY")
             else:
                 features.append("POST_PURCHASE:NO_ACTIVITY")
-            
-            # Lifetime value indicators - FIXED: Keep as DataFrame or use .len() for Series
-            if 'price_bucket' in purchases.columns:
-                # Option 1: Keep as DataFrame
-                price_df = purchases.filter(pl.col('price_bucket').is_not_null()).select('price_bucket')
-                if price_df.height > 0:
-                    total_purchase_value = price_df['price_bucket'].sum()
-                    features.append(f"LTV_INDICATOR:{total_purchase_value}")
-                else:
-                    features.append("LTV_INDICATOR:0")
-            else:
-                features.append("LTV_INDICATOR:NO_PRICE_DATA")
             
         except Exception as e:
             self.logger.error(f"Error in churn signals for client {client_id}: {e}", exc_info=True)
@@ -4225,7 +4115,11 @@ class TextRepresentationGenerator:
 
         # 3) Strip out RAW_SEQUENCE for the LLM
         def _strip_raw(txt: str) -> str:
-            return re.split(r'(?i)RAW_SEQUENCE:', txt, maxsplit=1)[0].rstrip()
+            return re.split(
+                r"\n## RAW_SEQUENCE ##\n",
+                txt,
+                maxsplit=1,
+            )[0].rstrip()
         
         stripped_texts: Dict[int, str] = {}
         for cid, rt in base_texts.items():
@@ -4237,6 +4131,8 @@ class TextRepresentationGenerator:
 
 
         # 4) Ask the LLM for plain-text bullet portraits
+        from .portrait_generator import generate_portraits
+
         portraits = generate_portraits(stripped_texts)
 
         # 5) Merge summary, portrait & RAW_SEQUENCE into one plain-text blob
@@ -4247,19 +4143,29 @@ class TextRepresentationGenerator:
             raw_seq  = rep.get("profile", {}).get("raw_sequence", "")
 
             # get the bullet list string from our LLM
-            portrait_str   = portraits.get(cid, "")
-            portrait_block = "\n## PORTRAIT ##\n" + portrait_str
+            portrait_str = portraits.get(cid, "")
 
-            raw_block = ("\n## RAW_SEQUENCE ##\n" + raw_seq) if raw_seq else ""
-            if summary.strip().endswith("```"):
-                summary += "\n```"
-            final_rich = "\n".join([
-                summary,
+            summary_without_raw = _strip_raw(summary)
+
+            raw_preview = ""
+            if raw_seq:
+                raw_preview = "\n".join(raw_seq.split("</s>")[-50:]) + "\n…"
+
+            final_parts = [
+                summary_without_raw,
                 "## PORTRAIT ##",
                 portrait_str.strip(),
-                "## RAW_SEQUENCE ##",
-                "\n".join(raw_seq.split("</s>")[-50:]) + "\n…",
-            ])
+            ]
+
+            if raw_preview:
+                final_parts.extend([
+                    "## RAW_SEQUENCE ##",
+                    raw_preview,
+                ])
+
+            final_parts.append("[END]")
+
+            final_rich = "\n".join(final_parts)
 
             enriched_texts[cid] = final_rich
 
@@ -4294,46 +4200,3 @@ class TextRepresentationGenerator:
                 f.write("\n")
 
         logger.info("✅  Representations saved.")
-
-
-class CustomBehaviorFeatureExtractor(FeatureExtractorBase):
-    """20+ nouvelles features issues du clustering SKU, Node2Vec, RFM quantiles…"""
-    def extract_features(self, client_id: int, events: pl.DataFrame, now: datetime) -> List[str]:
-        f = []
-        # — SKU cluster shares
-        skus = events.filter(pl.col('sku').is_not_null())['sku'].to_list()
-        if hasattr(self.parent, 'sku_cluster_map'):
-            cnt = Counter(self.parent.sku_cluster_map.get(int(s), -1) for s in skus)
-            total = sum(cnt.values()) or 1
-            top = cnt.most_common(3)
-            f.append("SKU_CLUSTER_SHARES:")
-            for cid, c in top:
-                f.append(f"  - C{cid}: {c/total:.0%}")
-        # — URL embedding similarity mean
-        ulist = events.filter(pl.col('url').is_not_null())['url'].to_list()
-        sims = []
-        for u in ulist:
-            vec = self.parent.url_embed.get(f"U_{u}")
-            if vec is not None:
-                sims.append(np.dot(vec, self.parent.url_centroid))
-        if sims:
-            f.append(f"URL_EMB_SIM: {float(np.mean(sims)):.3f}")
-        # — temporal cyclic features
-        hrs = events['timestamp'].dt.hour().to_numpy()
-        days = events['timestamp'].dt.weekday().to_numpy()
-        cyc = np.vstack([
-            np.sin(2*np.pi*hrs/24), np.cos(2*np.pi*hrs/24),
-            np.sin(2*np.pi*days/7), np.cos(2*np.pi*days/7)
-        ]).T
-        if len(cyc)>0:
-            mean_cyc = np.round(cyc.mean(axis=0),2).tolist()
-            f.append(f"TIME_CYCLIC_MEAN: {mean_cyc}")
-        # — RFM quantile for recency
-        recs = np.array(self.parent.global_stats.get('rfm_recencies',[]))
-        if recs.size>0:
-            last_buy = events.filter(pl.col('event_type')=='product_buy')['timestamp'].max()
-            if last_buy:
-                r = (now - last_buy).days
-                q = float((recs <= r).sum()/len(recs))
-                f.append(f"RFM_REC_Q: {q:.2f}")
-        return f
