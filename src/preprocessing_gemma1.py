@@ -58,11 +58,9 @@ def generate_complete_features_batch(client_batch: List[int], batch_id: int) -> 
     from collections import defaultdict
     import time
 
-    def timeout_handler(signum, frame):
-        raise TimeoutError(f"Batch {batch_id} timeout!")
-
-    signal.signal(signal.SIGALRM, timeout_handler)
-    signal.alarm(3600)  # 1 hour
+    # Windows does not support signal.SIGALRM.
+    # The outer future.result(timeout=600) already handles batch timeouts.
+    timeout_handler = None
 
     print(f"[Batch {batch_id}] Starting {len(client_batch)} clients...", flush=True)
     start_time = time.time()
@@ -272,13 +270,12 @@ def generate_complete_features_batch(client_batch: List[int], batch_id: int) -> 
                 # Build rich text
                 try:
                     rich_text = _build_rich_text(
-                        section_map=dict(section_map),
-                        max_tokens=MAX_RICH_TOKENS,
-                        implicit_repeat=IMPLICIT_WEIGHT_REPEAT,
-                        top_per_section=TOP_FEATURES_PER_SECTION,
-                        shuffle_seed=cid,
-                        use_markers=True
-                    )
+                    section_map=dict(section_map),
+                    max_tokens=MAX_RICH_TOKENS,
+                    top_per_section=TOP_FEATURES_PER_SECTION,
+                    shuffle_seed=cid,
+                    use_markers=True,
+                )
                 except:
                     rich_text = "\n\n".join(f"## {sec} ##\n" + "\n".join(lines[:20]) for sec, lines in section_map.items())
 
@@ -314,7 +311,7 @@ def generate_complete_features_batch(client_batch: List[int], batch_id: int) -> 
                     "json_str": json.dumps({"client_id": cid, "error": str(e)[:500]}, ensure_ascii=False)
                 }
 
-        signal.alarm(0)
+        #signal.alarm(0)
 
         total_time = time.time() - start_time
         print(f"[Batch {batch_id}] Completed {len(results)} clients in {total_time:.1f}s "
@@ -326,7 +323,7 @@ def generate_complete_features_batch(client_batch: List[int], batch_id: int) -> 
 
     except Exception as e:
         print(f"[Batch {batch_id}] FAILED: {e}", flush=True)
-        signal.alarm(0)
+        #signal.alarm(0)
         import traceback
         traceback.print_exc()
         return {cid: {"status": "batch_error", "error": str(e)[:500]} for cid in client_batch}
@@ -436,7 +433,8 @@ def main():
     print(f"Errors: {sum(1 for r in all_results.values() if r.get('status') != 'success')}")
     print(f"Failed batches clients: {len(failed_clients)}")
     
-    OUTPUT_DIR = "output_features/gemma1b"
+    OUTPUT_DIR = "output_features/retailrocket_gemma1b"
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
     # ============================================
     # Cellule 6: Sauvegarder (INCHANGÉ)
     save_path = f"{OUTPUT_DIR}/complete_features_{len(client_ids)}_clients.pkl"
