@@ -81,9 +81,14 @@ Produce a professional, concise behavioural portrait for recommender-system mode
 The portrait should expose signals useful for the evaluation tasks, not marketing advice.
 
 ### OUTPUT FORMAT
+- Do not copy raw feature lines verbatim.
+- Do not output section names such as [CHURN], [SEQ], [SKU], [CAT], or ## CHURN_PROPENSITY ##.
+- Do not output raw tags such as [OUT_OF_STOCK], [IN_STOCK], [REJECTED], [SUSPENDED], [INVALIDATED], or [END].
+- Do not output feature names alone, such as CHURN_RISK:HIGH or PURCHASE_RECENCY:106d.
+- Convert structured signals into natural behavioural interpretation.
 - Output 4 to 8 bullet points.
 - Each bullet must be one line.
-- Each line must start exactly with "- ".
+- Each line must start exactly with "- "
 - Plain English only.
 - No introduction.
 - No "Okay".
@@ -94,11 +99,13 @@ The portrait should expose signals useful for the evaluation tasks, not marketin
 - End with exactly: — FIN —
 
 ### GOOD EXAMPLE
-- Browsing-only user with no observed add-to-cart or purchase conversion.
-- Recent activity is concentrated in CAT_1254 and CAT_1317, with repeated exposure to SKU_362864.
-- Behaviour shows evening/weekend browsing and short within-session time gaps.
-- Availability exposure includes both OUT_OF_STOCK and IN_STOCK products, so availability may shape observed interactions.
-- High churn or inactivity risk should be considered if purchase recency and return signals are weak.
+- Buyer profile with strong historical conversion behaviour but currently high inactivity risk due to 106 days since last purchase and no activity in the last 14 days.
+- Behaviour shows broad multi-category exploration, with strong affinity toward CAT_1051, CAT_959, and CAT_808.
+- SKU affinity is concentrated around SKU_119736, SKU_198209, and SKU_37254, while browsing remains diverse across many products.
+- Funnel behaviour includes many page visits, meaningful add-to-cart activity, and a high cart-to-purchase conversion ratio.
+- Interactions are evening-dominant and often occur in deep sessions, suggesting intensive browsing when active.
+- Availability signals show mostly in-stock interactions, with some out-of-stock exposure during browsing.
+- Global-popularity overlap is stronger for categories than individual SKUs, so category-level recommendation signals may be more reliable.
 — FIN —
 
 ### BAD EXAMPLE
@@ -190,7 +197,7 @@ class PortraitGenerator:
         """Encode un batch de conversations"""
         conv_strings, cids = [], []
         for cid, rich in items:
-            profile_txt = self._strip_rich_text(rich, keep_raw=True)
+            profile_txt = self._strip_rich_text(rich, keep_raw=False)
     
             token_ids = self.base_tok.encode(profile_txt, add_special_tokens=False)[:MAX_PROMPT_TOKENS]
             profile_txt = self.base_tok.decode(token_ids, skip_special_tokens=True)
@@ -240,6 +247,44 @@ class PortraitGenerator:
     "- sure",
 )
 
+        forbidden_contains = (
+            "[CHURN]",
+            "[RECENT_HISTORY]",
+            "[TIME]",
+            "[SEQ]",
+            "[AVAIL]",
+            "[SOCIAL]",
+            "[TOP]",
+            "[SKU]",
+            "[CAT]",
+            "[STATS]",
+            "[MISC]",
+            "[END]",
+            "## ",
+            "[SUSPENDED]",
+            "[REJECTED]",
+            "[CANCELLED]",
+            "[INVALIDATED]",
+            "[LOST]",
+            "[UNAVAILABLE]",
+        )
+
+        raw_feature_prefixes = (
+            "- CHURN_RISK:",
+            "- PURCHASE_RECENCY:",
+            "- AVG_PURCHASE_INTERVAL:",
+            "- POST_PURCHASE:",
+            "- POST_PURCHASE_EVENTS:",
+            "- SKU_PROPENSITY",
+            "- CAT_PROPENSITY",
+            "- GLOBAL_TOP_",
+            "- BURST:",
+            "- H_cat:",
+            "- TOD_VAR:",
+            "- CENT_",
+            "- REC_RANK:",
+        )
+
         bullets = []
         for ln in text.splitlines():
             line = ln.strip()
@@ -250,8 +295,18 @@ class PortraitGenerator:
             if low.startswith(bad_starts):
                 continue
             
-            # Remove markdown bold markers if the model still emits them.
+            if any(x in line for x in forbidden_contains):
+                continue
+            
+            if line.startswith(raw_feature_prefixes):
+                continue
+            
             line = line.replace("**", "").strip()
+
+            # Keep only meaningful natural-language bullets.
+            if len(line) < 25:
+                continue
+            
             bullets.append(line)
         
         if not bullets:
