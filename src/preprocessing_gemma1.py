@@ -155,7 +155,7 @@ def generate_complete_features_batch(client_batch: List[int], batch_id: int) -> 
 
         # PROCESSING
         results = {}
-        now = datetime.now()
+        now = gen.reference_time or gen.dataset_end
         process_start = time.time()
 
         for idx, cid in enumerate(client_batch):
@@ -166,8 +166,8 @@ def generate_complete_features_batch(client_batch: List[int], batch_id: int) -> 
                       f"({elapsed:.1f}s, {rate:.1f} clients/s)", flush=True)
 
             try:
-                # Get events - DIRECT depuis events_df
-                events = gen.events_df.filter(pl.col('client_id') == cid)
+                # Get events from Retailrocket lazy pipeline
+                events = gen.get_client_events(cid)
 
                 if events.height == 0:
                     results[cid] = {
@@ -303,6 +303,7 @@ def generate_complete_features_batch(client_batch: List[int], batch_id: int) -> 
                 }
 
             except Exception as e:
+                print(f"[Batch {batch_id}] Client {cid} error: {e}", flush=True)
                 results[cid] = {
                     "status": "error",
                     "error": str(e)[:500],
@@ -310,6 +311,7 @@ def generate_complete_features_batch(client_batch: List[int], batch_id: int) -> 
                     "rich_text": f"ERROR: {str(e)[:200]}",
                     "json_str": json.dumps({"client_id": cid, "error": str(e)[:500]}, ensure_ascii=False)
                 }
+                
 
         #signal.alarm(0)
 
