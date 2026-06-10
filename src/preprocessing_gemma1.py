@@ -1,4 +1,5 @@
 #import unsloth
+from email import parser
 import os
 import sys
 import gc
@@ -205,16 +206,46 @@ def generate_complete_features_batch(client_batch: List[int], batch_id: int) -> 
                 for ex_name, extractor in gen._extractors.items():
                     if extractor is None:
                         continue
-                    tgt_sec = ex_to_sec.get(ex_name, "CUSTOM")
+                    
+                    default_sec = ex_to_sec.get(ex_name, "CUSTOM")
+
                     try:
                         feats = extractor.extract_features(cid, events, now)
-                        repeat = 1
+
                         for ft in feats:
-                            for _ in range(repeat):
-                                section_map[tgt_sec].append(ft)
+                            target_sec = default_sec
+
+                            # ChurnPropensityFeatureExtractor returns churn, SKU propensity
+                            # and category propensity features. Route them by prefix.
+                            if ex_name == "churn_propensity":
+                                if ft.startswith((
+                                    "CHURN_",
+                                    "PURCHASE_RECENCY:",
+                                    "PURCHASE_PATTERN:",
+                                    "AVG_PURCHASE_INTERVAL:",
+                                    "POST_PURCHASE",
+                                )):
+                                    target_sec = "CHURN_PROPENSITY"
+
+                                elif ft.startswith((
+                                    "CAT_PROPENSITY:",
+                                    "CAT_EXPLORATION_BREADTH:",
+                                    "PURCHASE_CAT_FOCUS:",
+                                )):
+                                    target_sec = "CAT_PROPENSITY"
+
+                                elif ft.startswith((
+                                    "SKU_PROPENSITY",
+                                    "REPEAT_PURCHASE_SKUS:",
+                                    "TOP_REPEAT_SKU:",
+                                )):
+                                    target_sec = "SKU_PROPENSITY"
+
+                            section_map[target_sec].append(ft)
                             features_json.append({"type": ex_name, "value": ft})
+
                     except Exception as err:
-                        section_map[tgt_sec].append(f"{ex_name}-error")
+                        section_map[default_sec].append(f"{ex_name}-error")
 
                 # Behavioral metrics
                 co_pairs = top_co_pairs(events)
@@ -250,10 +281,10 @@ def generate_complete_features_batch(client_batch: List[int], batch_id: int) -> 
                 hist_txt = gen._generate_aggregated_events_text(events.filter(pl.col("timestamp") < medium_cut))
 
                 if recent_txt != "No recent activity.":
-                    section_map["TARGET_WINDOW_14D"].append(recent_txt)
+                    section_map["RECENT_HISTORY_14D"].append(recent_txt)
                 else:
-                    section_map["TARGET_WINDOW_14D"].append("No activity in last 14 days")
-
+                    section_map["RECENT_HISTORY_14D"].append("No activity in last 14 days")
+                
                 if medium_txt != "No medium-term activity.":
                     section_map["SEQUENCE"].append(medium_txt)
                 if hist_txt != "No historical activity.":
@@ -351,8 +382,17 @@ def truncate_raw_sequence(raw_seq, max_events=100):
         
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--debug",           action="store_true",
-                       help="Mode DEBUG → Only 5 client ids")
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+        help="Mode DEBUG → Only 5 client ids",
+    )
+    parser.add_argument(
+        "--limit",
+        type=int,
+        default=0,
+        help="Optional number of clients to process. 0 means all clients.",
+    )
     
     # Configuration threads
     os.environ["OMP_NUM_THREADS"] = "4"
@@ -372,10 +412,13 @@ def main():
     print(f"Total clients: {len(client_ids):,}")
     print(f"First 10 client IDs: {client_ids[:10].tolist()}")
     if TEST_MODE:
-        # on fixe la liste des TEST clients, et on tronque à TEST_SIZE
         TEST_CLIENT_IDS = sorted(client_ids[:TEST_SIZE].tolist())
         client_ids = np.array(TEST_CLIENT_IDS, dtype=int)
-        print(f"🐛 DEBUG MODE: on ne traite que {TEST_SIZE} clients → {TEST_CLIENT_IDS}")
+        print(f"🐛 DEBUG MODE: processing {TEST_SIZE} clients → {TEST_CLIENT_IDS}")
+    elif args.limit and args.limit > 0:
+        client_ids = client_ids[:args.limit]
+        TEST_CLIENT_IDS = client_ids.tolist()
+        print(f"LIMIT MODE: processing first {len(client_ids)} clients.")
     else:
         TEST_CLIENT_IDS = None
         
@@ -541,8 +584,9 @@ def main():
     print(f"- Profiles: {profiles_path}")
 
     # Chemins
-    complete_features_path = f"{OUTPUT_DIR}/complete_features_{TEST_SIZE}_clients.pkl"
-    texts_path = f"{OUTPUT_DIR}/texts_for_portraits_{TEST_SIZE}.pkl"
+    CURRENT_SIZE = len(client_ids)
+    complete_features_path = f"{OUTPUT_DIR}/complete_features_{CURRENT_SIZE}_clients.pkl"
+    texts_path = f"{OUTPUT_DIR}/texts_for_portraits_{CURRENT_SIZE}.pkl"
 
     # Configuration
     MAX_EVENTS_TO_SHOW = 1000
@@ -716,7 +760,7 @@ def main():
     #     print("\n✅ Aucune correction nécessaire!")
 
     # Charger un client aléatoire
-    texts_path = f"{OUTPUT_DIR}/texts_for_portraits_{TEST_SIZE}.pkl"
+    texts_path = f"{OUTPUT_DIR}/texts_for_portraits_{CURRENT_SIZE}.pkl"
 
     with open(texts_path, 'rb') as f:
         texts = pickle.load(f)
@@ -762,7 +806,7 @@ def main():
     from pathlib import Path
     # ====== PARAMÈTRES PAR DÉFAUT ======
     OUTPUT_DIR       = Path("output_features/gemma1b")
-    TEXTS_FILE       = OUTPUT_DIR / f"texts_for_portraits_{TEST_SIZE}.pkl"
+    TEXTS_FILE       = OUTPUT_DIR / f"texts_for_portraits_{CURRENT_SIZE}.pkl"
     BATCH_SIZE       = 180          # nb de textes envoyés simultanément au modèle
     CHECKPOINT_EVERY = 100         # batches avant snapshot
     DRY_RUN_SIZE     = 6       # nombre de clients en mode --dry-run
@@ -1015,8 +1059,8 @@ print(f"[GPU {gpu_id}] FIN — {len(results)} portraits")
     from pathlib import Path
 
     OUTPUT_DIR      = Path("output_features/gemma1b")
-    FEATURES_PKL    = OUTPUT_DIR / f"complete_features_{TEST_SIZE}_clients.pkl" 
-    PORTRAITS_PKL   = OUTPUT_DIR / f"portraits_{TEST_SIZE}.pkl.gz" 
+    FEATURES_PKL    = OUTPUT_DIR / f"complete_features_{CURRENT_SIZE}_clients.pkl" 
+    PORTRAITS_PKL   = OUTPUT_DIR / f"portraits_{CURRENT_SIZE}.pkl.gz" 
 
     MAX_TOKENS = 2048                 
     USE_AUG2         = False
