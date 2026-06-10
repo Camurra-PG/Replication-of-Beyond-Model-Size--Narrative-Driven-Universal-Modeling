@@ -231,21 +231,106 @@ class PortraitGenerator:
             max_length=CTX_LIMIT - GEN_TOKENS,
         ).to(self.device)
     
-        return batch, cids
+        return batch, cids, [self._strip_rich_text(rich, keep_raw=False) for _, rich in items]
+    def _rule_based_portrait(self, source_text: str) -> str:
+        """Create a safe Retailrocket behavioural portrait if the LLM copies raw features."""
 
-    def _clean_portrait(self, raw_text: str) -> str:
-        """Nettoie le portrait généré"""
-        text = re.sub(r'```[\s\S]*?```', '', raw_text)
+        def find(pattern: str, default: str = "") -> str:
+            m = re.search(pattern, source_text)
+            return m.group(1).strip() if m else default
+
+        user_type = find(r"User Type:\s*([^\n]+)", "unknown")
+        churn = find(r"CHURN_RISK:([A-Z_]+)", "")
+        recency = find(r"PURCHASE_RECENCY:([^\n]+)", "")
+        last_activity = find(r"Days Since Last Activity:\s*([^\n]+)", "")
+        category_div = find(r"Category Diversity:([^\n]+)", "")
+        sessions = find(r"Sessions:\s*([^\n]+)", "")
+        top_skus = re.findall(r"SKU_PROPENSITY_TOP\d+:(SKU_\d+)", source_text)[:3]
+        top_cats = re.findall(r"CAT_PROPENSITY:(CAT_\d+)", source_text)[:3]
+        global_cat_cov = find(r"GLOBAL_TOP_CATEGORY_COVERAGE:([^\n]+)", "")
+        global_sku_cov = find(r"GLOBAL_TOP_SKU_COVERAGE:([^\n]+)", "")
+
+        has_purchase = "Purchases:" in source_text and not re.search(r"Purchases:\s*0\b", source_text)
+        has_cart = "Cart Adds:" in source_text and not re.search(r"Cart Adds:\s*0\b", source_text)
+
+        bullets = []
+
+        if user_type == "buyer" or has_purchase:
+            bullets.append(
+                "- Buyer profile with historical conversion behaviour, but current activity should be interpreted through recency and churn signals."
+            )
+        elif has_cart:
+            bullets.append(
+                "- Cart-active browsing profile with observed add-to-cart behaviour but limited confirmed purchase signal."
+            )
+        else:
+            bullets.append(
+                "- Browsing-only profile with no observed add-to-cart or purchase conversion in the available profile."
+            )
+
+        if churn or recency or last_activity:
+            parts = []
+            if churn:
+                parts.append(f"churn risk is {churn.lower()}")
+            if recency:
+                parts.append(f"purchase recency is {recency}")
+            if last_activity:
+                parts.append(f"last activity was {last_activity} ago")
+            bullets.append("- Inactivity signal is important: " + ", ".join(parts) + ".")
+
+        if top_cats:
+            bullets.append(
+                "- Category affinity is strongest around "
+                + ", ".join(top_cats)
+                + ", making category-level recommendation signals important."
+            )
+
+        if top_skus:
+            bullets.append(
+                "- SKU affinity is concentrated around "
+                + ", ".join(top_skus)
+                + ", while exact SKU repetition should be balanced with broader exploration."
+            )
+
+        if category_div:
+            bullets.append(
+                f"- Behaviour shows broad category exploration with category diversity {category_div}, suggesting recommendations should not be overly narrow."
+            )
+
+        if sessions:
+            bullets.append(
+                f"- Session behaviour is substantial, with {sessions} observed sessions and deep browsing patterns when active."
+            )
+
+        if global_cat_cov or global_sku_cov:
+            bullets.append(
+                f"- Global-popularity overlap is visible at category level ({global_cat_cov or 'unknown'}) and SKU level ({global_sku_cov or 'unknown'}), supporting popularity-aware ranking features."
+            )
+
+        if "OUT_OF_STOCK" in source_text or "IN_STOCK" in source_text:
+            bullets.append(
+                "- Availability exposure appears in the profile, so observed browsing and conversion should be interpreted together with in-stock and out-of-stock interactions."
+            )
+
+        bullets.append(
+            "- No reliable price, demographic, brand, or search-intent conclusions should be inferred from this Retailrocket profile."
+    )
+
+        return "\n".join(bullets[:8]) + "\n— FIN —"
+    
+    def _clean_portrait(self, raw_text: str, source_text: str = "") -> str:
+        """Clean the generated portrait and reject copied feature lines."""
+        text = re.sub(r"```[\s\S]*?```", "", raw_text)
         text = text.split("— FIN —", 1)[0]
-        
+
         bad_starts = (
-    "- okay",
-    "- here is",
-    "- here's",
-    "- below is",
-    "- certainly",
-    "- sure",
-)
+            "- okay",
+            "- here is",
+            "- here's",
+            "- below is",
+            "- certainly",
+            "- sure",
+        )
 
         forbidden_contains = (
             "[CHURN]",
@@ -267,9 +352,15 @@ class PortraitGenerator:
             "[INVALIDATED]",
             "[LOST]",
             "[UNAVAILABLE]",
+            "[OUT_OF_STOCK]",
+            "[IN_STOCK]",
         )
 
         raw_feature_prefixes = (
+            "- User Type:",
+            "- Funnel Stage:",
+            "- Category Diversity:",
+            "- Segments:",
             "- CHURN_RISK:",
             "- PURCHASE_RECENCY:",
             "- AVG_PURCHASE_INTERVAL:",
@@ -278,6 +369,12 @@ class PortraitGenerator:
             "- SKU_PROPENSITY",
             "- CAT_PROPENSITY",
             "- GLOBAL_TOP_",
+            "- Common sequence:",
+            "- Page visit",
+            "- page_visit",
+            "- Product Views:",
+            "- Cart Adds:",
+            "- Purchases:",
             "- BURST:",
             "- H_cat:",
             "- TOD_VAR:",
@@ -286,45 +383,45 @@ class PortraitGenerator:
         )
 
         bullets = []
+        copied_or_raw_count = 0
+
         for ln in text.splitlines():
             line = ln.strip()
             if not line.startswith("- "):
                 continue
-            
+
             low = line.lower()
             if low.startswith(bad_starts):
+                copied_or_raw_count += 1
                 continue
-            
+
             if any(x in line for x in forbidden_contains):
+                copied_or_raw_count += 1
                 continue
-            
+
             if line.startswith(raw_feature_prefixes):
+                copied_or_raw_count += 1
                 continue
-            
+
             line = line.replace("**", "").strip()
 
-            # Keep only meaningful natural-language bullets.
-            if len(line) < 25:
+            if len(line) < 35:
+                copied_or_raw_count += 1
                 continue
-            
+
             bullets.append(line)
-        
-        if not bullets:
-            cleaned = re.sub(r"\s+", " ", text).strip()
-            if cleaned and cleaned != "— FIN —":
-                bullets = [f"- {cleaned[:240]}"]
-            else:
-                bullets = [
-                    "- Sparse browsing-only profile with limited explicit conversion signal.",
-                    "- Behaviour is mainly represented through observed page visits, category/SKU exposure, recency, and availability interactions.",
-                    "- No reliable purchase, price, demographic, or search-intent conclusions should be inferred."
-                ]
-        
+
+        # If the LLM mostly copied tags/features or produced too few useful bullets,
+        # build a stable Retailrocket portrait from the structured source profile.
+        if len(bullets) < 4 or copied_or_raw_count >= 3:
+            return self._rule_based_portrait(source_text)
+
+        bullets = bullets[:8]
         return "\n".join(bullets) + "\n— FIN —"
 
     @torch.inference_mode()
     def generate_batch(self, items):
-        batch, cids = self._encode_batch(items)
+        batch, cids, source_texts = self._encode_batch(items)
     
         eos_id = self.base_tok.eos_token_id or self.base_tok.encode("— FIN —", add_special_tokens=False)[0]
     
@@ -342,7 +439,7 @@ class PortraitGenerator:
         for idx, cid in enumerate(cids):
             gen_part = generated[idx, int(prompt_lens[idx]):]
             text = self.base_tok.decode(gen_part, skip_special_tokens=True)
-            portraits[cid] = self._clean_portrait(text)
+            portraits[cid] = self._clean_portrait(text, source_texts[idx])
     
         return portraits
 
