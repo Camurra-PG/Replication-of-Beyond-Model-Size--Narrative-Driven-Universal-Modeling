@@ -1,4 +1,4 @@
-import unsloth
+#import unsloth
 import os
 import sys
 import gc
@@ -15,15 +15,15 @@ import multiprocessing as mp
 from tqdm.auto import tqdm
 from collections import defaultdict
 import random
-import gzip, zstandard as zstd
-import transformers, re, os, textwrap
+#import gzip, zstandard as zstd
+#import transformers, re, os, textwrap
 import os, sys, gc, pickle, subprocess, time, argparse, logging, gzip
 from collections import defaultdict
 from pathlib import Path
 from datetime import datetime
 import torch
 from concurrent.futures import ThreadPoolExecutor, as_completed
-import os, statistics, zstandard as zstd
+import os, statistics as zstd
 from tqdm.auto import tqdm
 
 # Paths for Retailrocket
@@ -53,7 +53,6 @@ def generate_complete_features_batch(client_batch: List[int], batch_id: int) -> 
         RAW_SEQUENCE_LAST_EVENTS,
         MAX_RICH_TOKENS,
         TOP_FEATURES_PER_SECTION,
-        IMPLICIT_WEIGHT_REPEAT,
         ChurnPropensityFeatureExtractor
     )
     from collections import defaultdict
@@ -127,31 +126,31 @@ def generate_complete_features_batch(client_batch: List[int], batch_id: int) -> 
 
         # Importer et ajouter les extracteurs depuis le module
         from ubm.text_representation_v3 import (
-            TemporalFeatureExtractor, SequenceFeatureExtractor, 
-            GraphFeatureExtractor, IntentFeatureExtractor,
-            PriceFeatureExtractor, SocialFeatureExtractor,
-            NameEmbeddingExtractor, TopSKUFeatureExtractor,
-            TopCategoryFeatureExtractor, ChurnPropensityFeatureExtractor,
-            CustomBehaviorFeatureExtractor
+            TemporalFeatureExtractor,
+            SequenceFeatureExtractor,
+            GraphFeatureExtractor,
+            IntentFeatureExtractor,
+            AvailabilityFeatureExtractor,
+            SocialFeatureExtractor,
+            RetailrocketGlobalPopularityFeatureExtractor,
+            ChurnPropensityFeatureExtractor,
         )
-
         gen._extractors = {
-            'temporal': TemporalFeatureExtractor(gen),
-            'sequence': SequenceFeatureExtractor(gen),
-            'graph': GraphFeatureExtractor(gen),
-            'intent': IntentFeatureExtractor(gen),
-            'price': PriceFeatureExtractor(gen),
-            'social': SocialFeatureExtractor(gen),
-            'name_embedding': NameEmbeddingExtractor(gen),
-            'churn_propensity': ChurnPropensityFeatureExtractor(gen),
+            "temporal": TemporalFeatureExtractor(gen),
+            "sequence": SequenceFeatureExtractor(gen),
+            "churn_propensity": ChurnPropensityFeatureExtractor(gen),
+            "graph": GraphFeatureExtractor(gen),
+            "intent": IntentFeatureExtractor(gen),
+            "availability": AvailabilityFeatureExtractor(gen),
         }
 
-        if hasattr(gen, 'top_skus') and gen.top_skus:
-            gen._extractors['top_sku'] = TopSKUFeatureExtractor(gen)
-        if hasattr(gen, 'top_categories') and gen.top_categories:
-            gen._extractors['top_category'] = TopCategoryFeatureExtractor(gen)
-        if hasattr(gen, 'sku_cluster_map'):
-            gen._extractors['custom_behavior'] = CustomBehaviorFeatureExtractor(gen)
+        if gen.product_popularity is not None:
+            gen._extractors["social"] = SocialFeatureExtractor(gen)
+
+        if gen.product_popularity is not None and gen.category_popularity is not None:
+            gen._extractors["retailrocket_global_popularity"] = (
+                RetailrocketGlobalPopularityFeatureExtractor(gen)
+            )
 
         print(f"[Batch {batch_id}] Setup completed in {time.time()-start_time:.1f}s", flush=True)
         print(f"[Batch {batch_id}] Available extractors: {list(gen._extractors.keys())}", flush=True)
@@ -197,14 +196,11 @@ def generate_complete_features_batch(client_batch: List[int], batch_id: int) -> 
                     "temporal": "TEMPORAL",
                     "sequence": "SEQUENCE",
                     "social": "SOCIAL",
-                    "price": "PRICE",
+                    "availability": "AVAILABILITY",
+                    "retailrocket_global_popularity": "GLOBAL_POPULARITY",
                     "intent": "OVERVIEW",
                     "graph": "CUSTOM",
-                    "name_embedding": "CUSTOM",
-                    "custom_behavior": "CUSTOM",
                     "churn_propensity": "CHURN_PROPENSITY",
-                    "top_sku": "SKU_PROPENSITY",
-                    "top_category": "CAT_PROPENSITY",
                 }
 
                 # Extract features
@@ -214,7 +210,7 @@ def generate_complete_features_batch(client_batch: List[int], batch_id: int) -> 
                     tgt_sec = ex_to_sec.get(ex_name, "CUSTOM")
                     try:
                         feats = extractor.extract_features(cid, events, now)
-                        repeat = IMPLICIT_WEIGHT_REPEAT if ex_name in ("top_sku", "top_category", "churn_propensity") else 1
+                        repeat = 1
                         for ft in feats:
                             for _ in range(repeat):
                                 section_map[tgt_sec].append(ft)
@@ -373,8 +369,9 @@ def main():
     TEST_SIZE = 5  # nombre de clients de test en debug
 
     # Charge tous les client_ids
-    client_ids = np.load(f"{DATA_DIR}/input/relevant_clients.npy").astype(int)
+    client_ids = np.load(f"{EVAL_DIR}/input/relevant_clients.npy").astype(int)
     print(f"Total clients: {len(client_ids):,}")
+    print(f"First 10 client IDs: {client_ids[:10].tolist()}")
     if TEST_MODE:
         # on fixe la liste des TEST clients, et on tronque à TEST_SIZE
         TEST_CLIENT_IDS = sorted(client_ids[:TEST_SIZE].tolist())
