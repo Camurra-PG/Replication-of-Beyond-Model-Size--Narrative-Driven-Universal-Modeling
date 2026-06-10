@@ -1,7 +1,8 @@
-import unsloth
+#import unsloth
 from email import parser
 import os
 import sys
+import io
 import gc
 import json
 import time
@@ -24,7 +25,8 @@ from pathlib import Path
 from datetime import datetime
 import torch
 from concurrent.futures import ThreadPoolExecutor, as_completed
-import os, statistics as zstd
+import os
+import statistics
 from tqdm.auto import tqdm
 
 # Paths for Retailrocket
@@ -1035,7 +1037,7 @@ print(f"[GPU {gpu_id}] FIN — {len(results)} portraits")
         logging.info("GPU %d : %s portraits", a["gpu"], f"{len(res):,}")
 
     # 7) Sauvegarde finale
-    final = OUTPUT_DIR / f"portraits_{len(portraits):,}.pkl.gz"
+    final = OUTPUT_DIR / f"portraits_{CURRENT_SIZE}.pkl.gz"
     with gzip.open(final, "wb") as f:
         pickle.dump(portraits, f, protocol=pickle.HIGHEST_PROTOCOL)
 
@@ -1066,7 +1068,7 @@ print(f"[GPU {gpu_id}] FIN — {len(results)} portraits")
     DROP_PROB_AUG1   = 0.35
     DROP_PROB_AUG2   = 0.50
     TOKENIZER_NAME   = "google/gemma-3-1b-it"
-    OUT_JSONL_ZST    = OUTPUT_DIR / "complete_dataset_1M.jsonl.zst"
+    OUT_JSONL_ZST = OUTPUT_DIR / f"complete_dataset_{CURRENT_SIZE}.jsonl.zst"
     TOKENIZER_BATCH  = 500
 
     # Vérifier que les fichiers existent
@@ -1185,152 +1187,13 @@ print(f"[GPU {gpu_id}] FIN — {len(results)} portraits")
     # ============================================
     print("\n✅ Portrait fusion finished. Skipping old 1M padding block for Retailrocket.")
     print(f"Clients actuels : {len(final_data)}")
-    print(f"Manquants : {1_000_000 - len(final_data)}")
 
-    # 1. Identifier TOUS les client_ids attendus
-    all_client_ids = set(all_results.keys())
-    processed_ids = set(final_data.keys())
-    missing_ids = all_client_ids - processed_ids
-
-    print(f"\nAnalyse des manquants:")
-    print(f"  → IDs dans all_results : {len(all_client_ids)}")
-    print(f"  → IDs traités : {len(processed_ids)}")
-    print(f"  → IDs manquants : {len(missing_ids)}")
-
-    # 2. Analyser pourquoi ils manquent
-    status_counts = {}
-    for cid in list(missing_ids)[:10]:  # Examiner les 10 premiers
-        if cid in all_results:
-            status = all_results[cid].get('status', 'unknown')
-            status_counts[status] = status_counts.get(status, 0) + 1
-
-    print(f"\nStatuts des manquants (échantillon):")
-    for status, count in status_counts.items():
-        print(f"  → {status}: {count}")
-
-    # 3. Créer des entrées fallback pour TOUS les clients manquants
-    print(f"\nCréation de {len(missing_ids)} entrées fallback...")
-
-    for cid in tqdm(missing_ids, desc="Ajout fallback"):
-        # Récupérer ce qu'on peut depuis all_results
-        if cid in all_results:
-            res = all_results[cid]
-
-            # Essayer de récupérer le rich_text même si status != success
-            rich_text = res.get('rich_text', '')
-
-            # Si pas de rich_text, essayer json_str
-            if not rich_text and 'json_str' in res:
-                try:
-                    jd = json.loads(res['json_str'])
-                    rich_text = jd.get('rich_text', '')
-                except:
-                    pass
-
-            # Si toujours rien, créer un texte minimal
-            if not rich_text:
-                rich_text = f"""[PROFILE]
-    ## OVERVIEW ##
-    [CLIENT_{cid}]
-    User Type: inactive
-    Status: {res.get('status', 'unknown')}
-
-    ## CHURN_PROPENSITY ##
-    CHURN_RISK: Unknown
-
-    ## TARGET_WINDOW_14D ##
-    No activity in last 14 days
-
-    ## TEMPORAL ##
-    Inactive: No recorded activity
-
-    ## CUSTOM ##
-    DEFAULT_USER: Fallback profile
-    Generated for completeness
-
-    [END]"""
-        else:
-            # Client complètement absent - créer minimal
-            rich_text = f"""[PROFILE]
-    ## OVERVIEW ##
-    [CLIENT_{cid}]
-    User Type: unknown
-    Status: missing
-
-    ## CUSTOM ##
-    DEFAULT_USER: Missing client
-    Generated for dataset completeness
-
-    [END]"""
-
-        # Ajouter le portrait si disponible
-        if cid in valid_portraits:
-            portrait = valid_portraits[cid].strip()
-            insert = f"\n## PORTRAIT ##\n{portrait}\n"
-            if "[END]" in rich_text:
-                rich_text = rich_text.replace("[END]", insert + "[END]")
-            else:
-                rich_text += insert
-
-        # Créer l'entrée finale
-        final_data[cid] = {
-            "profile": {"client_id": cid, "fallback": True},
-            "rich_text": rich_text
-        }
-
-    # 4. Vérification finale
-    print(f"\n✅ Correction appliquée:")
-    print(f"  → Total clients : {len(final_data)}")
-    print(f"  → Vérification : {'✓ Exactement 1M' if len(final_data) == 1_000_000 else '✗ PAS 1M!'}")
-
-    # 5. S'assurer qu'on a EXACTEMENT 1M
-    if len(final_data) != 1_000_000:
-        print(f"\n⚠️ ATTENTION: {len(final_data)} clients au lieu de 1,000,000!")
-
-        if len(final_data) > 1_000_000:
-            # Trop de clients - en retirer
-            excess = len(final_data) - 1_000_000
-            print(f"Suppression de {excess} clients en excès...")
-            clients_to_remove = list(final_data.keys())[-excess:]
-            for cid in clients_to_remove:
-                del final_data[cid]
-        else:
-            # Pas assez - compléter avec des IDs artificiels
-            shortage = 1_000_000 - len(final_data)
-            print(f"Ajout de {shortage} clients artificiels...")
-            max_id = max(all_client_ids)
-            for i in range(shortage):
-                artificial_id = max_id + i + 1
-                final_data[artificial_id] = {
-                    "profile": {"client_id": artificial_id, "artificial": True},
-                    "rich_text": f"""[PROFILE]
-    ## OVERVIEW ##
-    [CLIENT_{artificial_id}]
-    User Type: artificial
-    Status: padding
-
-    ## CUSTOM ##
-    ARTIFICIAL_USER: Added for 1M requirement
-
-    [END]"""
-                }
-
-    # 6. Vérification FINALE
-    assert len(final_data) == 1_000_000, f"ERREUR: {len(final_data)} clients au lieu de 1,000,000!"
-    print(f"\n✅ SUCCÈS: Exactement {len(final_data):,} clients!")
-
-    # Statistiques
-    fallback_count = sum(1 for d in final_data.values() if d.get('profile', {}).get('fallback', False))
-    artificial_count = sum(1 for d in final_data.values() if d.get('profile', {}).get('artificial', False))
-
-    print(f"\nComposition finale:")
-    print(f"  → Clients originaux : {len(final_data) - fallback_count - artificial_count:,}")
-    print(f"  → Clients fallback : {fallback_count:,}")
-    print(f"  → Clients artificiels : {artificial_count:,}")
-
-    # ============================================
+    print("\n✅ Retailrocket: skipping old 1M padding.")
+    print(f"Final clients for dataset: {len(final_data):,}")
 
     import io
+    # Retailrocket: no artificial 1M padding.
+    # Keep only the actually processed relevant clients.
     def augment_text(text: str, drop_prob: float, seed: int) -> str:
         """Drop aléatoire de lignes non critiques"""
         random.seed(seed)
@@ -1349,7 +1212,7 @@ print(f"[GPU {gpu_id}] FIN — {len(results)} portraits")
 
     print("\n=== SAUVEGARDE DU DATASET FINAL ===")
 
-    output_file = OUTPUT_DIR / "complete_texts_1M.jsonl.zst"
+    output_file = OUTPUT_DIR / f"complete_texts_{CURRENT_SIZE}.jsonl.zst"
     print(f"Destination : {output_file}")
 
     # S'assurer que le dossier de sortie existe
@@ -1555,7 +1418,7 @@ print(f"[GPU {gpu_id}] FIN — {len(results)} portraits")
     from pathlib import Path
 
     # Vérifier le fichier JSONL.zst correctement
-    OUT_JSONL_ZST = Path(f"{OUTPUT_DIR}/complete_dataset_1M.jsonl.zst")
+    OUT_JSONL_ZST = OUTPUT_DIR / f"complete_dataset_{CURRENT_SIZE}.jsonl.zst"
 
     print("=== VÉRIFICATION DU DATASET ===")
     print(f"Fichier : {OUT_JSONL_ZST}")
@@ -1632,7 +1495,7 @@ print(f"[GPU {gpu_id}] FIN — {len(results)} portraits")
     print(f"\n✅ TOTAL FINAL:")
     print(f"  → Records totaux: {total_records:,}")
     print(f"  → Clients uniques: {len(unique_clients):,}")
-    print(f"  → Vérification: {'✓ OK' if len(unique_clients) == 1_000_000 else '✗ ERREUR'}")
+    print(f"  → Vérification: {'✓ OK' if len(unique_clients) == CURRENT_SIZE else '✗ ERREUR'}")
 
     print("\n✅ Le dataset est prêt pour l'entraînement!")
 
