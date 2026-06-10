@@ -26,13 +26,18 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import os, statistics, zstandard as zstd
 from tqdm.auto import tqdm
 
-# Paths
-DATA_DIR = "ubc_data"
-CACHE_DIR = "ubc_data/cache_v3"
-OUTPUT_DIR = "output_features/gemma1b"
+# Paths for Retailrocket
+DATA_DIR = "retailrocket_data"
+EVAL_DIR = "retailrocket_eval_full"
+CACHE_DIR = "retailrocket_data/cache_eval_full"
+OUTPUT_DIR = "output_features/retailrocket_gemma1b"
+
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-print(f"CPUs disponibles: {mp.cpu_count()}")
+print(f"Available CPUs: {mp.cpu_count()}")
+print(f"Retailrocket data directory: {DATA_DIR}")
+print(f"Retailrocket eval directory: {EVAL_DIR}")
+print(f"Cache directory: {CACHE_DIR}")
 print(f"Output directory: {OUTPUT_DIR}")
 
 def generate_complete_features_batch(client_batch: List[int], batch_id: int) -> Dict:
