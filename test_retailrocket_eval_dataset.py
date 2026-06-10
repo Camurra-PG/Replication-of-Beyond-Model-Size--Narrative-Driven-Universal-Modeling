@@ -5,13 +5,17 @@ import polars as pl
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent
-ROOT = PROJECT_ROOT / "retailrocket_eval"
+ROOT = PROJECT_ROOT / "retailrocket_eval_full"
 INPUT_DIR = ROOT / "input"
 TARGET_DIR = ROOT / "target"
 
 
-def load_npy(name: str) -> np.ndarray:
-    path = TARGET_DIR / name
+EXPECTED_CATEGORY_TARGETS = 100
+EXPECTED_SKU_TARGETS = 100
+EXPECTED_NEW_SKU_TARGETS = 20
+
+
+def load_npy(path: Path) -> np.ndarray:
     if not path.exists():
         raise FileNotFoundError(f"Missing file: {path}")
     return np.load(path)
@@ -22,28 +26,24 @@ def main() -> None:
     train_target_path = TARGET_DIR / "train_target.parquet"
     validation_target_path = TARGET_DIR / "validation_target.parquet"
 
-    if not relevant_clients_path.exists():
-        raise FileNotFoundError(f"Missing file: {relevant_clients_path}")
+    relevant_clients = load_npy(relevant_clients_path)
+    active_clients = load_npy(TARGET_DIR / "active_clients.npy")
+
+    propensity_category = load_npy(TARGET_DIR / "propensity_category.npy")
+    propensity_sku = load_npy(TARGET_DIR / "propensity_sku.npy")
+    propensity_new_sku = load_npy(TARGET_DIR / "propensity_new_sku.npy")
+
+    popularity_category = load_npy(TARGET_DIR / "popularity_propensity_category.npy")
+    popularity_sku = load_npy(TARGET_DIR / "popularity_propensity_sku.npy")
+    popularity_new_sku = load_npy(TARGET_DIR / "popularity_propensity_new_sku.npy")
+
+    propensity_price = load_npy(TARGET_DIR / "propensity_price.npy")
+    popularity_price = load_npy(TARGET_DIR / "popularity_propensity_price.npy")
 
     if not train_target_path.exists():
         raise FileNotFoundError(f"Missing file: {train_target_path}")
-
     if not validation_target_path.exists():
         raise FileNotFoundError(f"Missing file: {validation_target_path}")
-
-    relevant_clients = np.load(relevant_clients_path)
-    active_clients = load_npy("active_clients.npy")
-
-    propensity_category = load_npy("propensity_category.npy")
-    propensity_sku = load_npy("propensity_sku.npy")
-    propensity_new_sku = load_npy("propensity_new_sku.npy")
-
-    popularity_category = load_npy("popularity_propensity_category.npy")
-    popularity_sku = load_npy("popularity_propensity_sku.npy")
-    popularity_new_sku = load_npy("popularity_propensity_new_sku.npy")
-
-    propensity_price = load_npy("propensity_price.npy")
-    popularity_price = load_npy("popularity_propensity_price.npy")
 
     train_target = pl.read_parquet(train_target_path)
     validation_target = pl.read_parquet(validation_target_path)
@@ -52,16 +52,20 @@ def main() -> None:
     print("relevant_clients:", relevant_clients.shape, relevant_clients.dtype)
     print("active_clients:", active_clients.shape, active_clients.dtype)
 
-    print("propensity_category:", propensity_category.shape, propensity_category.tolist())
-    print("propensity_sku:", propensity_sku.shape, propensity_sku.tolist())
-    print("propensity_new_sku:", propensity_new_sku.shape, propensity_new_sku.tolist())
+    print("propensity_category:", propensity_category.shape)
+    print("propensity_sku:", propensity_sku.shape)
+    print("propensity_new_sku:", propensity_new_sku.shape)
 
-    print("popularity_category:", popularity_category.shape, popularity_category.tolist())
-    print("popularity_sku:", popularity_sku.shape, popularity_sku.tolist())
-    print("popularity_new_sku:", popularity_new_sku.shape, popularity_new_sku.tolist())
+    print("popularity_category:", popularity_category.shape)
+    print("popularity_sku:", popularity_sku.shape)
+    print("popularity_new_sku:", popularity_new_sku.shape)
 
     print("propensity_price:", propensity_price.shape, propensity_price.tolist())
     print("popularity_price:", popularity_price.shape, popularity_price.tolist())
+
+    print("\nTop 10 category targets:", propensity_category[:10].tolist())
+    print("Top 10 sku targets:", propensity_sku[:10].tolist())
+    print("Top new sku targets:", propensity_new_sku.tolist())
 
     print("\n=== PARQUET SCHEMA ===")
     print("train_target schema:")
@@ -110,19 +114,56 @@ def main() -> None:
     print("Clients with target sku labels:", sku_positive)
     print("Clients with target new-sku labels:", new_sku_positive)
 
+    print("\n=== TARGET LABEL FREQUENCIES ===")
+
+    category_freq = (
+        all_targets
+        .select(pl.col("propensity_category").explode().alias("category_id"))
+        .drop_nulls()
+        .group_by("category_id")
+        .agg(pl.len().alias("positive_clients"))
+        .sort("positive_clients", descending=True)
+    )
+
+    sku_freq = (
+        all_targets
+        .select(pl.col("propensity_sku").explode().alias("sku"))
+        .drop_nulls()
+        .group_by("sku")
+        .agg(pl.len().alias("positive_clients"))
+        .sort("positive_clients", descending=True)
+    )
+
+    new_sku_freq = (
+        all_targets
+        .select(pl.col("propensity_new_sku").explode().alias("new_sku"))
+        .drop_nulls()
+        .group_by("new_sku")
+        .agg(pl.len().alias("positive_clients"))
+        .sort("positive_clients", descending=True)
+    )
+
+    print("\nCategory label frequency head:")
+    print(category_freq.head(10))
+
+    print("\nSKU label frequency head:")
+    print(sku_freq.head(10))
+
+    print("\nNew-SKU label frequency head:")
+    print(new_sku_freq.head(10))
+
     print("\n=== CONSISTENCY CHECKS ===")
 
     assert relevant_clients.ndim == 1
     assert relevant_clients.dtype == np.int64
-    assert relevant_clients.shape[0] == 5000, (
-        f"Expected 5000 relevant clients in debug setup, got {relevant_clients.shape[0]}"
+    assert relevant_clients.shape[0] > 5000, (
+        f"Expected full setup to contain more than 5000 clients, got {relevant_clients.shape[0]}"
     )
 
-    assert train_target.height == 4000, (
-        f"Expected 4000 train rows, got {train_target.height}"
-    )
-    assert validation_target.height == 1000, (
-        f"Expected 1000 validation rows, got {validation_target.height}"
+    assert train_target.height > 0
+    assert validation_target.height > 0
+    assert train_target.height + validation_target.height == relevant_clients.shape[0], (
+        "Train + validation row count does not match relevant_clients.npy."
     )
 
     expected_columns = {
@@ -146,9 +187,13 @@ def main() -> None:
     assert propensity_sku.shape == popularity_sku.shape
     assert propensity_new_sku.shape == popularity_new_sku.shape
 
-    assert propensity_category.shape[0] <= 5
-    assert propensity_sku.shape[0] <= 5
-    assert propensity_new_sku.shape[0] <= 5
+    assert propensity_category.shape[0] <= EXPECTED_CATEGORY_TARGETS
+    assert propensity_sku.shape[0] <= EXPECTED_SKU_TARGETS
+    assert propensity_new_sku.shape[0] <= EXPECTED_NEW_SKU_TARGETS
+
+    assert propensity_category.shape[0] > 0, "No category targets found."
+    assert propensity_sku.shape[0] > 0, "No SKU targets found."
+    assert propensity_new_sku.shape[0] > 0, "No new-SKU targets found."
 
     assert propensity_price.shape[0] == 0
     assert popularity_price.shape[0] == 0
@@ -170,7 +215,15 @@ def main() -> None:
         "active_clients.npy contains clients not present in relevant_clients.npy."
     )
 
-    print("\nRetailrocket evaluation dataset verified successfully.")
+    assert active_count == len(active_clients), (
+        "active_clients.npy count does not match active labels in target parquet files."
+    )
+
+    assert churn_defined.height > 0, "No churn labels defined."
+    assert churn_positive > 0, "No positive churn labels."
+    assert churn_negative > 0, "No negative churn labels."
+
+    print("\nRetailrocket FULL evaluation dataset verified successfully.")
 
 
 if __name__ == "__main__":
