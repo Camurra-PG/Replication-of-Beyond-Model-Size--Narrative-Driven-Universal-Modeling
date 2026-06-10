@@ -1,6 +1,7 @@
 from __future__ import annotations
 import json
 import logging
+from pydoc import text
 import torch
 import textwrap
 import os
@@ -31,56 +32,85 @@ if not HF_TOKEN:
     raise ValueError("La variable d'environnement HF_TOKEN n'est pas définie.")
 
 RETAILROCKET_BRIEF = textwrap.dedent("""
-[CONTEXT – RETAILROCKET E-COMMERCE BEHAVIOUR DATASET]
+[CONTEXT – Retailrocket E-Commerce Recommendation Evaluation]
 
-You receive a structured behavioural profile derived from observed
-Retailrocket interactions.
+You receive a structured Retailrocket e-commerce user profile derived from observed
+behavioural events.
+
+The downstream evaluation uses these user representations for recommendation-related
+prediction tasks such as:
+- churn / inactivity risk
+- category affinity / category propensity
+- SKU affinity / SKU propensity
+- new-SKU or exploration tendency
+- general recommendation relevance from observed behavioural patterns
 
 Observed event types:
 - page_visit
 - add_to_cart
 - product_buy
 
-Available profile signals may include:
-- user segment and recency/churn indicators
-- temporal browsing and purchase habits
-- view/cart/purchase funnel behaviour
-- product availability interactions
-- personal SKU and category propensities
-- overlap with globally popular Retailrocket SKUs and categories
-- category/product exploration and graph-centrality signals
+Available signals may include:
+- user type and behavioural segments
+- churn, purchase recency, activity gap, and return-risk indicators
+- recent activity over the last 14 days
+- temporal habits such as time of day, weekday/weekend behaviour, session rhythm
+- browsing, cart, and purchase funnel behaviour
+- SKU_PROPENSITY signals for personal product affinity
+- CAT_PROPENSITY signals for personal category affinity
+- GLOBAL_TOP_SKU / GLOBAL_TOP_CAT overlap with globally popular items/categories
+- availability interactions such as IN_STOCK or OUT_OF_STOCK exposure
+- category/product co-occurrence and sparse graph-centrality indicators
+- RAW_SEQUENCE containing chronological Retailrocket events
 
-Important interpretation rules:
-- The current Retailrocket pipeline does not provide validated price data.
-- The current Retailrocket pipeline does not provide search-query behaviour.
-- Do not infer price sensitivity, discount responsiveness, search intent,
-  demographics, brand preferences, or causal explanations.
+Important dataset limitations:
+- There is no validated price data in this Retailrocket pipeline.
+- There is no validated search-query behaviour in this Retailrocket pipeline.
+- Do not infer price sensitivity, discount responsiveness, search intent, demographics,
+  brands, income, gender, age, or causal explanations.
 - Do not invent SKU or category identifiers.
 - Preserve relevant SKU_... and CAT_... identifiers exactly as provided.
-- SKU_PROPENSITY and CAT_PROPENSITY describe personal user affinity.
-- GLOBAL_TOP_* signals describe overlap with globally popular products or
-  categories derived from the available observation history.
+- If the user has only page_visit events, describe them as browsing-only.
+- If the user has no purchases or carts, explicitly say there is no observed conversion signal.
+- Never answer that the behavioural signal is too sparse if at least one event exists.
+- Even for sparse browsing-only users, produce useful behavioural bullets from recency,
+  category/SKU exposure, availability, popularity overlap, and churn/return indicators.
 
-Produce a concise behavioural portrait suitable for a text-based user
-representation in recommender-system modelling.
+Overall goal:
+Produce a professional, concise behavioural portrait for recommender-system modelling.
+The portrait should expose signals useful for the evaluation tasks, not marketing advice.
 
 ### OUTPUT FORMAT
 - Output 4 to 8 bullet points.
-- Each line must start with "- ".
+- Each bullet must be one line.
+- Each line must start exactly with "- ".
 - Plain English only.
-- Describe observed behavioural signals, not marketing actions.
-- Mention recency or churn risk when present.
-- Mention funnel behaviour when present.
-- Mention important SKU/category affinities or global-popularity overlap when present.
-- Do not output code, markdown headings, code fences, or explanations.
-- Terminate with "— FIN —".
-- Never answer that the behavioural signal is too sparse if the client has at least one observed event.
-- For sparse browsing-only users, still produce 3 to 5 bullets based on observed page visits, recency, categories, SKU exposure, availability, popularity overlap, and churn/return likelihood.
-- If there are no purchases or add-to-cart events, explicitly describe the user as browsing-only rather than saying the signal is unusable.
+- No introduction.
+- No "Okay".
+- No "Here is".
+- No markdown headings.
+- No code.
+- No explanations outside the bullets.
+- End with exactly: — FIN —
 
+### GOOD EXAMPLE
+- Browsing-only user with no observed add-to-cart or purchase conversion.
+- Recent activity is concentrated in CAT_1254 and CAT_1317, with repeated exposure to SKU_362864.
+- Behaviour shows evening/weekend browsing and short within-session time gaps.
+- Availability exposure includes both OUT_OF_STOCK and IN_STOCK products, so availability may shape observed interactions.
+- High churn or inactivity risk should be considered if purchase recency and return signals are weak.
 — FIN —
-""")
 
+### BAD EXAMPLE
+Okay, here is a breakdown of the user behaviour:
+The user seems interesting and might like some products.
+
+### REMINDER
+You are an expert behavioural analyst.
+Write only the bullet list.
+Do not include introductions, summaries, headings, or code fences.
+Terminate with — FIN —.
+""")
 
 def _device_list() -> list[str]:
     """Liste des devices disponibles"""
@@ -114,12 +144,13 @@ class PortraitGenerator:
         self.base_tok = getattr(self.tpl, "tokenizer", self.tpl)
 
         self.system_header = (
-            "You are an expert behavioural analyst.\n"
-            "Do NOT generate ANY code, functions, or code fences.\n"
-            "Be concise and human-readable.\n"
-            "Terminate with '— FIN —'\n"
-        )
-
+    "You are an expert behavioural analyst for recommender-system user modelling.\n"
+    "Return ONLY plain bullet points.\n"
+    "Every output line except the final terminator must start with '- '.\n"
+    "Do NOT write introductions such as 'Okay', 'Here is', or 'Below is'.\n"
+    "Do NOT generate code, markdown headings, tables, explanations, or code fences.\n"
+    "Terminate with exactly '— FIN —'.\n"
+)
     def _strip_rich_text(
     self,
     rt: str,
@@ -200,10 +231,28 @@ class PortraitGenerator:
         text = re.sub(r'```[\s\S]*?```', '', raw_text)
         text = text.split("— FIN —", 1)[0]
         
-        bullets = [
-            ln.strip() for ln in text.splitlines()
-            if ln.strip().startswith("- ")
-        ]
+        bad_starts = (
+    "- okay",
+    "- here is",
+    "- here's",
+    "- below is",
+    "- certainly",
+    "- sure",
+)
+
+        bullets = []
+        for ln in text.splitlines():
+            line = ln.strip()
+            if not line.startswith("- "):
+                continue
+            
+            low = line.lower()
+            if low.startswith(bad_starts):
+                continue
+            
+            # Remove markdown bold markers if the model still emits them.
+            line = line.replace("**", "").strip()
+            bullets.append(line)
         
         if not bullets:
             cleaned = re.sub(r"\s+", " ", text).strip()
