@@ -13,7 +13,9 @@ PYTHON := python3
 
 # RetailRocket data directory used by preprocessing_gemma1.py / preprocessing_gemma12.py
 DATA_DIR := retailrocket_data
-
+EVAL_DIR := retailrocket_eval_full
+MIN_HISTORY_EVENTS := 5
+MAX_CLIENTS := 0
 MODELS_DIR := models
 FEATURES_DIR := output_features
 EMBEDDINGS_DIR := embeddings
@@ -50,6 +52,12 @@ show_config:
 data:
 	@echo "--- 1. Downloading RetailRocket data ---"
 	@bash src/download_data.sh $(DATA_DIR)
+	@echo "--- 1b. Building RetailRocket evaluation dataset ---"
+	$(PYTHON) src/build_retailrocket_eval_dataset.py \
+		--data-dir $(DATA_DIR) \
+		--out-dir $(EVAL_DIR) \
+		--min-history-events $(MIN_HISTORY_EVENTS) \
+		--max-clients $(MAX_CLIENTS)
 
 # Step 2: Feature Generation
 features: data
