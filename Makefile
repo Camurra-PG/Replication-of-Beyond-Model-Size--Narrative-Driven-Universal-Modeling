@@ -53,7 +53,7 @@ data:
 	@echo "--- 1. Downloading RetailRocket data ---"
 	@bash src/download_data.sh $(DATA_DIR)
 	@echo "--- 1b. Building RetailRocket evaluation dataset ---"
-	$(PYTHON) src/build_retailrocket_eval_dataset.py \
+	$(PYTHON) build_retailrocket_eval_dataset.py \
 		--data-dir $(DATA_DIR) \
 		--out-dir $(EVAL_DIR) \
 		--min-history-events $(MIN_HISTORY_EVENTS) \
