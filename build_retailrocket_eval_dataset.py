@@ -412,12 +412,38 @@ def main() -> None:
     # Train/validation split on client IDs
     # ------------------------------------------------------------
     rng = np.random.default_rng(args.seed)
-    shuffled = relevant_clients.copy()
-    rng.shuffle(shuffled)
 
-    n_valid = max(1, int(len(shuffled) * args.validation_ratio))
-    valid_clients = np.sort(shuffled[:n_valid])
-    train_clients = np.sort(shuffled[n_valid:])
+    # Clients mit mindestens einem Propensity-Label (aus allen drei Spalten) identifizieren
+    labeled_client_ids = set(
+        target_purchases_for_labels
+        .filter(
+            pl.col("category_id").is_not_null()
+            | pl.col("sku").is_not_null()
+            | pl.col("new_sku").is_not_null()
+        )["client_id"]
+        .unique()
+        .to_list()
+    )
+    
+    labeled_mask = np.isin(relevant_clients, list(labeled_client_ids))
+    labeled_clients = relevant_clients[labeled_mask]
+    unlabeled_clients = relevant_clients[~labeled_mask]
+    
+    # Beide Gruppen GETRENNT shuffeln und im selben Verhältnis splitten
+    rng.shuffle(labeled_clients)
+    rng.shuffle(unlabeled_clients)
+
+    n_valid_labeled = max(1, int(len(labeled_clients) * args.validation_ratio))
+    n_valid_unlabeled = max(1, int(len(unlabeled_clients) * args.validation_ratio))
+    
+    valid_clients = np.sort(np.concatenate([
+        labeled_clients[:n_valid_labeled],
+        unlabeled_clients[:n_valid_unlabeled],
+    ]))
+    train_clients = np.sort(np.concatenate([
+        labeled_clients[n_valid_labeled:],
+        unlabeled_clients[n_valid_unlabeled:],
+    ]))
 
     train_target = build_target_frame(
         clients=train_clients,
