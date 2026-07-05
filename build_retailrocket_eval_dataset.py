@@ -4,6 +4,7 @@ import argparse
 from pathlib import Path
 
 import numpy as np
+import pandas as pd
 import polars as pl
 
 
@@ -467,6 +468,15 @@ def main() -> None:
 
     train_target.write_parquet(target_dir / "train_target.parquet")
     validation_target.write_parquet(target_dir / "validation_target.parquet")
+
+    # Dummy-Datei: Retailrocket hat keine validierten Preise/Produktnamen,
+    # aber DataDir._validate_data_dir() verlangt trotzdem diese Datei.
+    pd.DataFrame({
+        "sku": pd.Series([], dtype="int64"),
+        "category": pd.Series([], dtype="int64"),
+        "price": pd.Series([], dtype="int64"),
+        "name": pd.Series([], dtype="object"),
+    }).to_parquet(out_dir / "product_properties.parquet")
 
     print("\nSaved files:")
     print(f"- {input_dir / 'relevant_clients.npy'}")

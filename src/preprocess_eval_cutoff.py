@@ -25,7 +25,7 @@ from ubm.text_representation_v3 import AdvancedUBMGenerator
 
 # ====== KONFIGURATION: an deinen finalen target_days=75 Lauf angepasst ======
 DATA_DIR = "retailrocket_data"
-EVAL_DIR = "retailrocket_eval_sweep_75"          # dein finaler, gewaehlter Eval-Datensatz
+EVAL_DIR = "retailrocket_eval_final"          # dein finaler, gewaehlter Eval-Datensatz
 CACHE_DIR = "retailrocket_data/cache_eval_cutoff75"  # NEUER, dedizierter Cache (nicht der alte!)
 OUTPUT_DIR = "output_features/retailrocket_eval_cutoff75"
 OBSERVATION_CUTOFF = datetime(2015, 7, 5, 2, 59, 47, 788000)  # exakt dein Sweep-75 Cutoff
