@@ -522,7 +522,8 @@ def generate_portraits(rich_texts: dict[int, str],
     # Lancer les processus en parallèle
     portraits = {}
     
-    with ProcessPoolExecutor(max_workers=len(devices)) as executor:
+    ctx = mp.get_context("spawn")
+    with ProcessPoolExecutor(max_workers=len(devices), mp_context=ctx) as executor:
         # Préparer tous les jobs
         future_to_device = {}
         
