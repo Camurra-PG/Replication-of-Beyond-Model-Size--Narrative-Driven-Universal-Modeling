@@ -112,7 +112,14 @@ def generate_complete_features_batch(client_batch: List[int], batch_id: int) -> 
             os.environ["SKIP_URL_GRAPH"] = "1"
 
             # Forcer le chargement en mémoire
-            gen.load_data(use_cache=True, relevant_client_ids=None)  # None = charger TOUT
+            from datetime import datetime
+            OBSERVATION_CUTOFF = datetime(2015, 7, 5, 2, 59, 47, 788000)  # exakt dein Sweep-75-Cutoff
+            
+            gen.load_data(
+                use_cache=False,  # WICHTIG: der alte Cache wurde ohne Cutoff berechnet, darf hier nicht wiederverwendet werden
+                relevant_client_ids=client_batch,
+                observation_end=OBSERVATION_CUTOFF,
+            )
 
             if gen.events_df is not None:
                 print(f"[Batch {batch_id}] Loaded {gen.events_df.height:,} total events", flush=True)

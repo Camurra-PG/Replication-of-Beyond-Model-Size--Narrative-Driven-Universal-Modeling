@@ -1950,7 +1950,6 @@ class AdvancedUBMGenerator:
             can_restore_shared_cache = (
                 use_cache
                 and not self.debug_mode
-                and observation_end is None
             )
 
             cache_loaded = False
@@ -1993,18 +1992,11 @@ class AdvancedUBMGenerator:
                 self._build_global_centralities()
 
                 if use_cache and not self.debug_mode:
-                    if observation_end is None:
-                        self._save_calculated_data_to_cache()
-                        self.logger.info(
-                            "Saved derived Retailrocket statistics to cache. "
-                            "Event data remains lazy."
-                        )
-                    else:
-                        self.logger.info(
-                            "Skipping shared derived-cache write for "
-                            "cutoff-based run to avoid mixing temporal "
-                            "evaluation states."
-                        )
+                    self._save_calculated_data_to_cache()
+                    self.logger.info(
+                        "Saved derived Retailrocket statistics to cache (reference_time=%s).",
+                        self.reference_time,
+                    )
             else:
                 self.logger.info(
                     "Reusing cached Retailrocket derived features; "
