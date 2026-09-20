@@ -1,4 +1,4 @@
-# Narrative-Driven Universal Behavioral Modeling — Master's Thesis Fork
+# Narrative-Driven Universal Behavioral Modeling — Retailrocket Adaption
 
 Code for the master's thesis *"Replicating a Narrative-Driven Universal Behavior Modeling Approach"* (Mutlu Orhan, University of Klagenfurt, supervised by Prof. Dietmar Jannach).
 
