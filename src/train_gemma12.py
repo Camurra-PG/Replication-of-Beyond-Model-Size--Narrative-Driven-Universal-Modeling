@@ -173,7 +173,12 @@ def build_dataset(pattern: str, max_len: int = 512) -> IterableDataset:
                 ids = rec.get("input_ids", [])
                 if not ids:
                     continue
-                aug = rec.get("input_ids_aug") or ids
+                aug = (
+                    rec.get("input_ids_aug")
+                    or rec.get("input_ids_aug1")
+                    or rec.get("input_ids_aug2")
+                    or ids
+                )
                 yield {"input_ids": ids[:max_len], "input_ids_aug": aug[:max_len]}
                 count += 1
                 if count % 1000 == 0:

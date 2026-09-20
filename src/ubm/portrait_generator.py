@@ -1,6 +1,7 @@
 from __future__ import annotations
 import json
 import logging
+from pydoc import text
 import torch
 import textwrap
 import os
@@ -23,65 +24,100 @@ logging.basicConfig(
 MODEL_NAME = "unsloth/gemma-3-1b-it-unsloth-bnb-4bit"
 #MODEL_NAME = "google/gemma-3-1b-it"
 CTX_LIMIT = 3048
-MAX_PROMPT_TOKENS = 400  # Réduit de 512 pour éviter OOM
-GEN_TOKENS = 128
+MAX_PROMPT_TOKENS = int(os.getenv("PORTRAIT_MAX_PROMPT_TOKENS", "1800"))  # Réduit de 512 pour éviter OOM
+GEN_TOKENS = 192
 BATCH_SIZE = int(os.getenv("PORTRAIT_BATCH", "180")) 
 HF_TOKEN = os.getenv("HF_TOKEN")
 if not HF_TOKEN:
     raise ValueError("La variable d'environnement HF_TOKEN n'est pas définie.")
 
-# [COMPETITION_BRIEF reste identique]
-COMPETITION_BRIEF = textwrap.dedent("""
-[CONTEXT – ACM RecSys Challenge 2025]
+RETAILROCKET_BRIEF = textwrap.dedent("""
+[CONTEXT – Retailrocket E-Commerce Recommendation Evaluation]
 
-You receive a **structured e-commerce user profile** (> 1 M SKUs).
-Produce a professional and exhaustive **behavioural portrait** as a list of plain-text bullet points for stakeholders.
+You receive a structured Retailrocket e-commerce user profile derived from observed
+behavioural events.
 
-Open tasks:
- • **churn** – binary; churn if ≥ 1 purchase **and** ≥ 14 days inactivity  
- • **propensity_category** – multilabel; top-100 categories  
- • **propensity_sku**      – multilabel; top-100 SKUs  
+The downstream evaluation uses these user representations for recommendation-related
+prediction tasks such as:
+- churn / inactivity risk
+- category affinity / category propensity
+- SKU affinity / SKU propensity
+- new-SKU or exploration tendency
+- general recommendation relevance from observed behavioural patterns
 
-Hidden tasks:
-Exposé general signals: temporal habits, funnel stage, price sensitivity, popularity,
-exploration vs purchase, etc.
+Observed event types:
+- page_visit
+- add_to_cart
+- product_buy
 
-Overall metric = 0.8 × AUROC + 0.1 × Novelty + 0.1 × Diversity.
-Key User Behavior Insights:
+Available signals may include:
+- user type and behavioural segments
+- churn, purchase recency, activity gap, and return-risk indicators
+- recent activity over the last 14 days
+- temporal habits such as time of day, weekday/weekend behaviour, session rhythm
+- browsing, cart, and purchase funnel behaviour
+- SKU_PROPENSITY signals for personal product affinity
+- CAT_PROPENSITY signals for personal category affinity
+- GLOBAL_TOP_SKU / GLOBAL_TOP_CAT overlap with globally popular items/categories
+- availability interactions such as IN_STOCK or OUT_OF_STOCK exposure
+- category/product co-occurrence and sparse graph-centrality indicators
+- RAW_SEQUENCE containing chronological Retailrocket events
 
-Segmentation: 96% of users are non-buyers; only 4% purchase.
-Purchase Path: 57% of purchases occur without a preceding add_to_cart event. The most common journey involves multiple page visits before a purchase.
-User Loyalty: 77% of buyers are single-category loyal.
-Timing: Average time from add_to_cart to buy is 32 minutes; from search to buy is over 2 hours.
-Signal Strength: add_to_cart is a significantly stronger purchase predictor (0.53 correlation) than search (0.34).
+Important dataset limitations:
+- There is no validated price data in this Retailrocket pipeline.
+- There is no validated search-query behaviour in this Retailrocket pipeline.
+- Do not infer price sensitivity, discount responsiveness, search intent, demographics,
+  brands, income, gender, age, or causal explanations.
+- Do not invent SKU or category identifiers.
+- Preserve relevant SKU_... and CAT_... identifiers exactly as provided.
+- If the user has only page_visit events, describe them as browsing-only.
+- If the user has no purchases or carts, explicitly say there is no observed conversion signal.
+- Never answer that the behavioural signal is too sparse if at least one event exists.
+- Even for sparse browsing-only users, produce useful behavioural bullets from recency,
+  category/SKU exposure, availability, popularity overlap, and churn/return indicators.
 
-### OUTPUT FORMAT (≤ 10 bullets, each on its own line)
-- Each line must start with "- " (dash + space)
-- No code, no functions, no code fences
-- Plain English only
+Overall goal:
+Produce a professional, concise behavioural portrait for recommender-system modelling.
+The portrait should expose signals useful for the evaluation tasks, not marketing advice.
 
-### EXAMPLES
-**Good:**
-- Category_XXX enthusiast with declining engagement.
-- Key segment: SKU_XXX
-- Evening shopper
-- High price sensitivity
-- Recommendation: Send 10% discount on top SKUs
+### OUTPUT FORMAT
+- Do not copy raw feature lines verbatim.
+- Do not output section names such as [CHURN], [SEQ], [SKU], [CAT], or ## CHURN_PROPENSITY ##.
+- Do not output raw tags such as [OUT_OF_STOCK], [IN_STOCK], [REJECTED], [SUSPENDED], [INVALIDATED], or [END].
+- Do not output feature names alone, such as CHURN_RISK:HIGH or PURCHASE_RECENCY:106d.
+- Convert structured signals into natural behavioural interpretation.
+- Output 4 to 8 bullet points.
+- Each bullet must be one line.
+- Each line must start exactly with "- "
+- Plain English only.
+- No introduction.
+- No "Okay".
+- No "Here is".
+- No markdown headings.
+- No code.
+- No explanations outside the bullets.
+- End with exactly: — FIN —
 
-**Bad:**
-```python
-def summarize_user_profile(...):
-    ...
-```
-
-REMINDER:
-You are an expert behavioural analyst.
-Do NOT generate ANY code, functions, or code fences.
-Be concise and human-readable.
-
+### GOOD EXAMPLE
+- Buyer profile with strong historical conversion behaviour but currently high inactivity risk due to 106 days since last purchase and no activity in the last 14 days.
+- Behaviour shows broad multi-category exploration, with strong affinity toward CAT_1051, CAT_959, and CAT_808.
+- SKU affinity is concentrated around SKU_119736, SKU_198209, and SKU_37254, while browsing remains diverse across many products.
+- Funnel behaviour includes many page visits, meaningful add-to-cart activity, and a high cart-to-purchase conversion ratio.
+- Interactions are evening-dominant and often occur in deep sessions, suggesting intensive browsing when active.
+- Availability signals show mostly in-stock interactions, with some out-of-stock exposure during browsing.
+- Global-popularity overlap is stronger for categories than individual SKUs, so category-level recommendation signals may be more reliable.
 — FIN —
-""")
 
+### BAD EXAMPLE
+Okay, here is a breakdown of the user behaviour:
+The user seems interesting and might like some products.
+
+### REMINDER
+You are an expert behavioural analyst.
+Write only the bullet list.
+Do not include introductions, summaries, headings, or code fences.
+Terminate with — FIN —.
+""")
 
 def _device_list() -> list[str]:
     """Liste des devices disponibles"""
@@ -115,26 +151,46 @@ class PortraitGenerator:
         self.base_tok = getattr(self.tpl, "tokenizer", self.tpl)
 
         self.system_header = (
-            "You are an expert behavioural analyst.\n"
-            "Do NOT generate ANY code, functions, or code fences.\n"
-            "Be concise and human-readable.\n"
-            "Terminate with '— FIN —'\n"
+    "You are an expert behavioural analyst for recommender-system user modelling.\n"
+    "Return ONLY plain bullet points.\n"
+    "Every output line except the final terminator must start with '- '.\n"
+    "Do NOT write introductions such as 'Okay', 'Here is', or 'Below is'.\n"
+    "Do NOT generate code, markdown headings, tables, explanations, or code fences.\n"
+    "Terminate with exactly '— FIN —'.\n"
+)
+    def _strip_rich_text(
+    self,
+    rt: str,
+    keep_raw: bool = False,
+    last_n: int = 30,
+) -> str:
+        """
+        Prepare a compact Retailrocket profile for portrait generation.
+    
+        Raw event sequences and recent-history event listings are removed because
+        the portrait should be based on the compact behavioural summaries,
+        propensities, and popularity signals.
+        """
+        rt = re.sub(
+            r"##\s*PORTRAIT\s*##.*?(?=##|$|\[END\])",
+            "",
+            rt,
+            flags=re.DOTALL,
         )
-
-    def _strip_rich_text(self, rt: str, keep_raw: bool = False, last_n: int = 30) -> str:
-        """Nettoie le texte pour le portrait"""
-        import re
-        
-        rt = re.sub(r'##\s*PORTRAIT\s*##.*?(?=##|$|\[END\])', '', rt, flags=re.DOTALL)
+    
         if not keep_raw:
-            rt = re.sub(r'##\s*RAW_SEQUENCE\s*##.*?(?=##|$|\[END\])', '', rt, flags=re.DOTALL)
-        rt = rt.replace('[END]', '').strip()
-        
-        
-        # Limite ajoutée pour éviter OOM
-        if len(rt) > 6000:  # ~1500 tokens max
-            rt = rt[:6000] + "\n[TRUNCATED FOR MEMORY]"
-        
+            rt = re.sub(
+                r"##\s*RAW_SEQUENCE\s*##.*?(?=##|$|\[END\])",
+                "",
+                rt,
+                flags=re.DOTALL,
+            )
+    
+        rt = rt.replace("[END]", "").strip()
+    
+        if len(rt) > 8000:
+            rt = rt[:8000] + "\n[TRUNCATED FOR MEMORY]"
+    
         return rt
 
     def _encode_batch(self, items):
@@ -150,7 +206,7 @@ class PortraitGenerator:
                 {
                     "role": "system",
                     "content": (
-                        self.system_header.strip() + "\n\n" + COMPETITION_BRIEF.strip()
+                        self.system_header.strip() + "\n\n" + RETAILROCKET_BRIEF.strip()
                     ),
                 },
                 {
@@ -175,26 +231,197 @@ class PortraitGenerator:
             max_length=CTX_LIMIT - GEN_TOKENS,
         ).to(self.device)
     
-        return batch, cids
+        return batch, cids, [self._strip_rich_text(rich, keep_raw=False) for _, rich in items]
+    def _rule_based_portrait(self, source_text: str) -> str:
+        """Create a safe Retailrocket behavioural portrait if the LLM copies raw features."""
 
-    def _clean_portrait(self, raw_text: str) -> str:
-        """Nettoie le portrait généré"""
-        text = re.sub(r'```[\s\S]*?```', '', raw_text)
+        def find(pattern: str, default: str = "") -> str:
+            m = re.search(pattern, source_text)
+            return m.group(1).strip() if m else default
+
+        user_type = find(r"User Type:\s*([^\n]+)", "unknown")
+        churn = find(r"CHURN_RISK:([A-Z_]+)", "")
+        recency = find(r"PURCHASE_RECENCY:([^\n]+)", "")
+        last_activity = find(r"Days Since Last Activity:\s*([^\n]+)", "")
+        category_div = find(r"Category Diversity:([^\n]+)", "")
+        sessions = find(r"Sessions:\s*([^\n]+)", "")
+        top_skus = re.findall(r"SKU_PROPENSITY_TOP\d+:(SKU_\d+)", source_text)[:3]
+        top_cats = re.findall(r"CAT_PROPENSITY:(CAT_\d+)", source_text)[:3]
+        global_cat_cov = find(r"GLOBAL_TOP_CATEGORY_COVERAGE:([^\n]+)", "")
+        global_sku_cov = find(r"GLOBAL_TOP_SKU_COVERAGE:([^\n]+)", "")
+
+        has_purchase = "Purchases:" in source_text and not re.search(r"Purchases:\s*0\b", source_text)
+        has_cart = "Cart Adds:" in source_text and not re.search(r"Cart Adds:\s*0\b", source_text)
+
+        bullets = []
+
+        if user_type == "buyer" or has_purchase:
+            bullets.append(
+                "- Buyer profile with historical conversion behaviour, but current activity should be interpreted through recency and churn signals."
+            )
+        elif has_cart:
+            bullets.append(
+                "- Cart-active browsing profile with observed add-to-cart behaviour but limited confirmed purchase signal."
+            )
+        else:
+            bullets.append(
+                "- Browsing-only profile with no observed add-to-cart or purchase conversion in the available profile."
+            )
+
+        if churn or recency or last_activity:
+            parts = []
+            if churn:
+                parts.append(f"churn risk is {churn.lower()}")
+            if recency:
+                parts.append(f"purchase recency is {recency}")
+            if last_activity:
+                parts.append(f"last activity was {last_activity} ago")
+            bullets.append("- Inactivity signal is important: " + ", ".join(parts) + ".")
+
+        if top_cats:
+            bullets.append(
+                "- Category affinity is strongest around "
+                + ", ".join(top_cats)
+                + ", making category-level recommendation signals important."
+            )
+
+        if top_skus:
+            bullets.append(
+                "- SKU affinity is concentrated around "
+                + ", ".join(top_skus)
+                + ", while exact SKU repetition should be balanced with broader exploration."
+            )
+
+        if category_div:
+            bullets.append(
+                f"- Behaviour shows broad category exploration with category diversity {category_div}, suggesting recommendations should not be overly narrow."
+            )
+
+        if sessions:
+            bullets.append(
+                f"- Session behaviour is substantial, with {sessions} observed sessions and deep browsing patterns when active."
+            )
+
+        if global_cat_cov or global_sku_cov:
+            bullets.append(
+                f"- Global-popularity overlap is visible at category level ({global_cat_cov or 'unknown'}) and SKU level ({global_sku_cov or 'unknown'}), supporting popularity-aware ranking features."
+            )
+
+        if "OUT_OF_STOCK" in source_text or "IN_STOCK" in source_text:
+            bullets.append(
+                "- Availability exposure appears in the profile, so observed browsing and conversion should be interpreted together with in-stock and out-of-stock interactions."
+            )
+
+        bullets.append(
+            "- No reliable price, demographic, brand, or search-intent conclusions should be inferred from this Retailrocket profile."
+    )
+
+        return "\n".join(bullets[:8]) + "\n— FIN —"
+    
+    def _clean_portrait(self, raw_text: str, source_text: str = "") -> str:
+        """Clean the generated portrait and reject copied feature lines."""
+        text = re.sub(r"```[\s\S]*?```", "", raw_text)
         text = text.split("— FIN —", 1)[0]
-        
-        bullets = [
-            ln.strip() for ln in text.splitlines()
-            if ln.strip().startswith("- ")
-        ]
-        
-        if not bullets:
-            bullets = ["- Behavioural signal too sparse to summarise."]
-        
+
+        bad_starts = (
+            "- okay",
+            "- here is",
+            "- here's",
+            "- below is",
+            "- certainly",
+            "- sure",
+        )
+
+        forbidden_contains = (
+            "[CHURN]",
+            "[RECENT_HISTORY]",
+            "[TIME]",
+            "[SEQ]",
+            "[AVAIL]",
+            "[SOCIAL]",
+            "[TOP]",
+            "[SKU]",
+            "[CAT]",
+            "[STATS]",
+            "[MISC]",
+            "[END]",
+            "## ",
+            "[SUSPENDED]",
+            "[REJECTED]",
+            "[CANCELLED]",
+            "[INVALIDATED]",
+            "[LOST]",
+            "[UNAVAILABLE]",
+            "[OUT_OF_STOCK]",
+            "[IN_STOCK]",
+        )
+
+        raw_feature_prefixes = (
+            "- User Type:",
+            "- Funnel Stage:",
+            "- Category Diversity:",
+            "- Segments:",
+            "- CHURN_RISK:",
+            "- PURCHASE_RECENCY:",
+            "- AVG_PURCHASE_INTERVAL:",
+            "- POST_PURCHASE:",
+            "- POST_PURCHASE_EVENTS:",
+            "- SKU_PROPENSITY",
+            "- CAT_PROPENSITY",
+            "- GLOBAL_TOP_",
+            "- Common sequence:",
+            "- Page visit",
+            "- page_visit",
+            "- Product Views:",
+            "- Cart Adds:",
+            "- Purchases:",
+            "- BURST:",
+            "- H_cat:",
+            "- TOD_VAR:",
+            "- CENT_",
+            "- REC_RANK:",
+        )
+
+        bullets = []
+        copied_or_raw_count = 0
+
+        for ln in text.splitlines():
+            line = ln.strip()
+            if not line.startswith("- "):
+                continue
+
+            low = line.lower()
+            if low.startswith(bad_starts):
+                copied_or_raw_count += 1
+                continue
+
+            if any(x in line for x in forbidden_contains):
+                copied_or_raw_count += 1
+                continue
+
+            if line.startswith(raw_feature_prefixes):
+                copied_or_raw_count += 1
+                continue
+
+            line = line.replace("**", "").strip()
+
+            if len(line) < 35:
+                copied_or_raw_count += 1
+                continue
+
+            bullets.append(line)
+
+        # If the LLM mostly copied tags/features or produced too few useful bullets,
+        # build a stable Retailrocket portrait from the structured source profile.
+        if len(bullets) < 4 or copied_or_raw_count >= 3:
+            return self._rule_based_portrait(source_text)
+
+        bullets = bullets[:8]
         return "\n".join(bullets) + "\n— FIN —"
 
     @torch.inference_mode()
     def generate_batch(self, items):
-        batch, cids = self._encode_batch(items)
+        batch, cids, source_texts = self._encode_batch(items)
     
         eos_id = self.base_tok.eos_token_id or self.base_tok.encode("— FIN —", add_special_tokens=False)[0]
     
@@ -212,7 +439,7 @@ class PortraitGenerator:
         for idx, cid in enumerate(cids):
             gen_part = generated[idx, int(prompt_lens[idx]):]
             text = self.base_tok.decode(gen_part, skip_special_tokens=True)
-            portraits[cid] = self._clean_portrait(text)
+            portraits[cid] = self._clean_portrait(text, source_texts[idx])
     
         return portraits
 
@@ -295,7 +522,8 @@ def generate_portraits(rich_texts: dict[int, str],
     # Lancer les processus en parallèle
     portraits = {}
     
-    with ProcessPoolExecutor(max_workers=len(devices)) as executor:
+    ctx = mp.get_context("spawn")
+    with ProcessPoolExecutor(max_workers=len(devices), mp_context=ctx) as executor:
         # Préparer tous les jobs
         future_to_device = {}
         

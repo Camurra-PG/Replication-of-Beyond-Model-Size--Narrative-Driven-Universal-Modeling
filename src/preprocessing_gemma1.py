@@ -1,6 +1,8 @@
 import unsloth
+from email import parser
 import os
 import sys
+import io
 import gc
 import json
 import time
@@ -23,16 +25,22 @@ from pathlib import Path
 from datetime import datetime
 import torch
 from concurrent.futures import ThreadPoolExecutor, as_completed
-import os, statistics, zstandard as zstd
+import os
+import statistics
 from tqdm.auto import tqdm
 
-# Paths
-DATA_DIR = "ubc_data"
-CACHE_DIR = "ubc_data/cache_v3"
-OUTPUT_DIR = "output_features/gemma1b"
+# Paths for Retailrocket
+DATA_DIR = "retailrocket_data"
+EVAL_DIR = "retailrocket_eval_full"
+CACHE_DIR = "retailrocket_data/cache_eval_full"
+OUTPUT_DIR = "output_features/retailrocket_gemma1b"
+
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-print(f"CPUs disponibles: {mp.cpu_count()}")
+print(f"Available CPUs: {mp.cpu_count()}")
+print(f"Retailrocket data directory: {DATA_DIR}")
+print(f"Retailrocket eval directory: {EVAL_DIR}")
+print(f"Cache directory: {CACHE_DIR}")
 print(f"Output directory: {OUTPUT_DIR}")
 
 def generate_complete_features_batch(client_batch: List[int], batch_id: int) -> Dict:
@@ -48,17 +56,14 @@ def generate_complete_features_batch(client_batch: List[int], batch_id: int) -> 
         RAW_SEQUENCE_LAST_EVENTS,
         MAX_RICH_TOKENS,
         TOP_FEATURES_PER_SECTION,
-        IMPLICIT_WEIGHT_REPEAT,
         ChurnPropensityFeatureExtractor
     )
     from collections import defaultdict
     import time
 
-    def timeout_handler(signum, frame):
-        raise TimeoutError(f"Batch {batch_id} timeout!")
-
-    signal.signal(signal.SIGALRM, timeout_handler)
-    signal.alarm(3600)  # 1 hour
+    # Windows does not support signal.SIGALRM.
+    # The outer future.result(timeout=600) already handles batch timeouts.
+    timeout_handler = None
 
     print(f"[Batch {batch_id}] Starting {len(client_batch)} clients...", flush=True)
     start_time = time.time()
@@ -107,7 +112,14 @@ def generate_complete_features_batch(client_batch: List[int], batch_id: int) -> 
             os.environ["SKIP_URL_GRAPH"] = "1"
 
             # Forcer le chargement en mémoire
-            gen.load_data(use_cache=True, relevant_client_ids=None)  # None = charger TOUT
+            from datetime import datetime
+            OBSERVATION_CUTOFF = datetime(2015, 7, 5, 2, 59, 47, 788000)  # exakt dein Sweep-75-Cutoff
+            
+            gen.load_data(
+                use_cache=False,  # WICHTIG: der alte Cache wurde ohne Cutoff berechnet, darf hier nicht wiederverwendet werden
+                relevant_client_ids=client_batch,
+                observation_end=OBSERVATION_CUTOFF,
+            )
 
             if gen.events_df is not None:
                 print(f"[Batch {batch_id}] Loaded {gen.events_df.height:,} total events", flush=True)
@@ -122,38 +134,38 @@ def generate_complete_features_batch(client_batch: List[int], batch_id: int) -> 
 
         # Importer et ajouter les extracteurs depuis le module
         from ubm.text_representation_v3 import (
-            TemporalFeatureExtractor, SequenceFeatureExtractor, 
-            GraphFeatureExtractor, IntentFeatureExtractor,
-            PriceFeatureExtractor, SocialFeatureExtractor,
-            NameEmbeddingExtractor, TopSKUFeatureExtractor,
-            TopCategoryFeatureExtractor, ChurnPropensityFeatureExtractor,
-            CustomBehaviorFeatureExtractor
+            TemporalFeatureExtractor,
+            SequenceFeatureExtractor,
+            GraphFeatureExtractor,
+            IntentFeatureExtractor,
+            AvailabilityFeatureExtractor,
+            SocialFeatureExtractor,
+            RetailrocketGlobalPopularityFeatureExtractor,
+            ChurnPropensityFeatureExtractor,
         )
-
         gen._extractors = {
-            'temporal': TemporalFeatureExtractor(gen),
-            'sequence': SequenceFeatureExtractor(gen),
-            'graph': GraphFeatureExtractor(gen),
-            'intent': IntentFeatureExtractor(gen),
-            'price': PriceFeatureExtractor(gen),
-            'social': SocialFeatureExtractor(gen),
-            'name_embedding': NameEmbeddingExtractor(gen),
-            'churn_propensity': ChurnPropensityFeatureExtractor(gen),
+            "temporal": TemporalFeatureExtractor(gen),
+            "sequence": SequenceFeatureExtractor(gen),
+            "churn_propensity": ChurnPropensityFeatureExtractor(gen),
+            "graph": GraphFeatureExtractor(gen),
+            "intent": IntentFeatureExtractor(gen),
+            "availability": AvailabilityFeatureExtractor(gen),
         }
 
-        if hasattr(gen, 'top_skus') and gen.top_skus:
-            gen._extractors['top_sku'] = TopSKUFeatureExtractor(gen)
-        if hasattr(gen, 'top_categories') and gen.top_categories:
-            gen._extractors['top_category'] = TopCategoryFeatureExtractor(gen)
-        if hasattr(gen, 'sku_cluster_map'):
-            gen._extractors['custom_behavior'] = CustomBehaviorFeatureExtractor(gen)
+        if gen.product_popularity is not None:
+            gen._extractors["social"] = SocialFeatureExtractor(gen)
+
+        if gen.product_popularity is not None and gen.category_popularity is not None:
+            gen._extractors["retailrocket_global_popularity"] = (
+                RetailrocketGlobalPopularityFeatureExtractor(gen)
+            )
 
         print(f"[Batch {batch_id}] Setup completed in {time.time()-start_time:.1f}s", flush=True)
         print(f"[Batch {batch_id}] Available extractors: {list(gen._extractors.keys())}", flush=True)
 
         # PROCESSING
         results = {}
-        now = datetime.now()
+        now = gen.reference_time or gen.dataset_end
         process_start = time.time()
 
         for idx, cid in enumerate(client_batch):
@@ -164,8 +176,8 @@ def generate_complete_features_batch(client_batch: List[int], batch_id: int) -> 
                       f"({elapsed:.1f}s, {rate:.1f} clients/s)", flush=True)
 
             try:
-                # Get events - DIRECT depuis events_df
-                events = gen.events_df.filter(pl.col('client_id') == cid)
+                # Get events from Retailrocket lazy pipeline
+                events = gen.get_client_events(cid)
 
                 if events.height == 0:
                     results[cid] = {
@@ -192,30 +204,57 @@ def generate_complete_features_batch(client_batch: List[int], batch_id: int) -> 
                     "temporal": "TEMPORAL",
                     "sequence": "SEQUENCE",
                     "social": "SOCIAL",
-                    "price": "PRICE",
+                    "availability": "AVAILABILITY",
+                    "retailrocket_global_popularity": "GLOBAL_POPULARITY",
                     "intent": "OVERVIEW",
                     "graph": "CUSTOM",
-                    "name_embedding": "CUSTOM",
-                    "custom_behavior": "CUSTOM",
                     "churn_propensity": "CHURN_PROPENSITY",
-                    "top_sku": "SKU_PROPENSITY",
-                    "top_category": "CAT_PROPENSITY",
                 }
 
                 # Extract features
                 for ex_name, extractor in gen._extractors.items():
                     if extractor is None:
                         continue
-                    tgt_sec = ex_to_sec.get(ex_name, "CUSTOM")
+                    
+                    default_sec = ex_to_sec.get(ex_name, "CUSTOM")
+
                     try:
                         feats = extractor.extract_features(cid, events, now)
-                        repeat = IMPLICIT_WEIGHT_REPEAT if ex_name in ("top_sku", "top_category", "churn_propensity") else 1
+
                         for ft in feats:
-                            for _ in range(repeat):
-                                section_map[tgt_sec].append(ft)
+                            target_sec = default_sec
+
+                            # ChurnPropensityFeatureExtractor returns churn, SKU propensity
+                            # and category propensity features. Route them by prefix.
+                            if ex_name == "churn_propensity":
+                                if ft.startswith((
+                                    "CHURN_",
+                                    "PURCHASE_RECENCY:",
+                                    "PURCHASE_PATTERN:",
+                                    "AVG_PURCHASE_INTERVAL:",
+                                    "POST_PURCHASE",
+                                )):
+                                    target_sec = "CHURN_PROPENSITY"
+
+                                elif ft.startswith((
+                                    "CAT_PROPENSITY:",
+                                    "CAT_EXPLORATION_BREADTH:",
+                                    "PURCHASE_CAT_FOCUS:",
+                                )):
+                                    target_sec = "CAT_PROPENSITY"
+
+                                elif ft.startswith((
+                                    "SKU_PROPENSITY",
+                                    "REPEAT_PURCHASE_SKUS:",
+                                    "TOP_REPEAT_SKU:",
+                                )):
+                                    target_sec = "SKU_PROPENSITY"
+
+                            section_map[target_sec].append(ft)
                             features_json.append({"type": ex_name, "value": ft})
+
                     except Exception as err:
-                        section_map[tgt_sec].append(f"{ex_name}-error")
+                        section_map[default_sec].append(f"{ex_name}-error")
 
                 # Behavioral metrics
                 co_pairs = top_co_pairs(events)
@@ -251,10 +290,10 @@ def generate_complete_features_batch(client_batch: List[int], batch_id: int) -> 
                 hist_txt = gen._generate_aggregated_events_text(events.filter(pl.col("timestamp") < medium_cut))
 
                 if recent_txt != "No recent activity.":
-                    section_map["TARGET_WINDOW_14D"].append(recent_txt)
+                    section_map["RECENT_HISTORY_14D"].append(recent_txt)
                 else:
-                    section_map["TARGET_WINDOW_14D"].append("No activity in last 14 days")
-
+                    section_map["RECENT_HISTORY_14D"].append("No activity in last 14 days")
+                
                 if medium_txt != "No medium-term activity.":
                     section_map["SEQUENCE"].append(medium_txt)
                 if hist_txt != "No historical activity.":
@@ -271,13 +310,12 @@ def generate_complete_features_batch(client_batch: List[int], batch_id: int) -> 
                 # Build rich text
                 try:
                     rich_text = _build_rich_text(
-                        section_map=dict(section_map),
-                        max_tokens=MAX_RICH_TOKENS,
-                        implicit_repeat=IMPLICIT_WEIGHT_REPEAT,
-                        top_per_section=TOP_FEATURES_PER_SECTION,
-                        shuffle_seed=cid,
-                        use_markers=True
-                    )
+                    section_map=dict(section_map),
+                    max_tokens=MAX_RICH_TOKENS,
+                    top_per_section=TOP_FEATURES_PER_SECTION,
+                    shuffle_seed=cid,
+                    use_markers=True,
+                )
                 except:
                     rich_text = "\n\n".join(f"## {sec} ##\n" + "\n".join(lines[:20]) for sec, lines in section_map.items())
 
@@ -305,6 +343,7 @@ def generate_complete_features_batch(client_batch: List[int], batch_id: int) -> 
                 }
 
             except Exception as e:
+                print(f"[Batch {batch_id}] Client {cid} error: {e}", flush=True)
                 results[cid] = {
                     "status": "error",
                     "error": str(e)[:500],
@@ -312,8 +351,9 @@ def generate_complete_features_batch(client_batch: List[int], batch_id: int) -> 
                     "rich_text": f"ERROR: {str(e)[:200]}",
                     "json_str": json.dumps({"client_id": cid, "error": str(e)[:500]}, ensure_ascii=False)
                 }
+                
 
-        signal.alarm(0)
+        #signal.alarm(0)
 
         total_time = time.time() - start_time
         print(f"[Batch {batch_id}] Completed {len(results)} clients in {total_time:.1f}s "
@@ -325,7 +365,7 @@ def generate_complete_features_batch(client_batch: List[int], batch_id: int) -> 
 
     except Exception as e:
         print(f"[Batch {batch_id}] FAILED: {e}", flush=True)
-        signal.alarm(0)
+        #signal.alarm(0)
         import traceback
         traceback.print_exc()
         return {cid: {"status": "batch_error", "error": str(e)[:500]} for cid in client_batch}
@@ -351,8 +391,17 @@ def truncate_raw_sequence(raw_seq, max_events=100):
         
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--debug",           action="store_true",
-                       help="Mode DEBUG → Only 5 client ids")
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+        help="Mode DEBUG → Only 5 client ids",
+    )
+    parser.add_argument(
+        "--limit",
+        type=int,
+        default=0,
+        help="Optional number of clients to process. 0 means all clients.",
+    )
     
     # Configuration threads
     os.environ["OMP_NUM_THREADS"] = "4"
@@ -368,19 +417,23 @@ def main():
     TEST_SIZE = 5  # nombre de clients de test en debug
 
     # Charge tous les client_ids
-    client_ids = np.load(f"{DATA_DIR}/input/relevant_clients.npy").astype(int)
+    client_ids = np.load(f"{EVAL_DIR}/input/relevant_clients.npy").astype(int)
     print(f"Total clients: {len(client_ids):,}")
+    print(f"First 10 client IDs: {client_ids[:10].tolist()}")
     if TEST_MODE:
-        # on fixe la liste des TEST clients, et on tronque à TEST_SIZE
         TEST_CLIENT_IDS = sorted(client_ids[:TEST_SIZE].tolist())
         client_ids = np.array(TEST_CLIENT_IDS, dtype=int)
-        print(f"🐛 DEBUG MODE: on ne traite que {TEST_SIZE} clients → {TEST_CLIENT_IDS}")
+        print(f"🐛 DEBUG MODE: processing {TEST_SIZE} clients → {TEST_CLIENT_IDS}")
+    elif args.limit and args.limit > 0:
+        client_ids = client_ids[:args.limit]
+        TEST_CLIENT_IDS = client_ids.tolist()
+        print(f"LIMIT MODE: processing first {len(client_ids)} clients.")
     else:
         TEST_CLIENT_IDS = None
         
 
     BATCH_SIZE = 1000
-    N_WORKERS = min(16, mp.cpu_count() // 2)
+    N_WORKERS = 1
 
     print(f"Configuration:")
     print(f"- Batch size: {BATCH_SIZE}")
@@ -434,7 +487,8 @@ def main():
     print(f"Errors: {sum(1 for r in all_results.values() if r.get('status') != 'success')}")
     print(f"Failed batches clients: {len(failed_clients)}")
     
-    OUTPUT_DIR = "output_features/gemma1b"
+    OUTPUT_DIR = "output_features/retailrocket_gemma1b"
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
     # ============================================
     # Cellule 6: Sauvegarder (INCHANGÉ)
     save_path = f"{OUTPUT_DIR}/complete_features_{len(client_ids)}_clients.pkl"
@@ -453,18 +507,19 @@ def main():
 
     # Sections mises à jour avec les nouvelles
     expected_sections = [
-        "OVERVIEW", 
-        "CHURN_PROPENSITY",      # NOUVELLE
-        "TARGET_WINDOW_14D",     # NOUVELLE
-        "TEMPORAL", 
-        "SEQUENCE", 
-        "PRICE", 
-        "SOCIAL", 
-        "SKU_PROPENSITY",        # NOUVELLE  
-        "CAT_PROPENSITY",        # NOUVELLE
-        "PROP_SUBSET_STATS",     # NOUVELLE
-        "CUSTOM"
-    ]
+    "OVERVIEW",
+    "CHURN_PROPENSITY",
+    "RECENT_HISTORY_14D",
+    "TEMPORAL",
+    "SEQUENCE",
+    "AVAILABILITY",
+    "SOCIAL",
+    "GLOBAL_POPULARITY",
+    "SKU_PROPENSITY",
+    "CAT_PROPENSITY",
+    "PROP_SUBSET_STATS",
+    "CUSTOM",
+]
 
     sample_results = [r for r in all_results.values() if r.get('status') == 'success'][:5]
 
@@ -483,8 +538,21 @@ def main():
 
         # Vérifier les markers
         print("\n  Section Markers:")
-        markers = ["[PROFILE]", "[CHURN]", "[RECENT]", "[TIME]", "[SEQ]", 
-                   "[PRICE]", "[SOCIAL]", "[SKU]", "[CAT]", "[STATS]", "[MISC]", "[END]"]
+        markers = [
+            "[PROFILE]",
+            "[CHURN]",
+            "[RECENT_HISTORY]",
+            "[TIME]",
+            "[SEQ]",
+            "[AVAIL]",
+            "[SOCIAL]",
+            "[TOP]",
+            "[SKU]",
+            "[CAT]",
+            "[STATS]",
+            "[MISC]",
+            "[END]",
+        ]
         for marker in markers:
             if marker in rich_text:
                 print(f"  ✓ {marker}")
@@ -525,8 +593,9 @@ def main():
     print(f"- Profiles: {profiles_path}")
 
     # Chemins
-    complete_features_path = f"{OUTPUT_DIR}/complete_features_{TEST_SIZE}_clients.pkl"
-    texts_path = f"{OUTPUT_DIR}/texts_for_portraits_{TEST_SIZE}.pkl"
+    CURRENT_SIZE = len(client_ids)
+    complete_features_path = f"{OUTPUT_DIR}/complete_features_{CURRENT_SIZE}_clients.pkl"
+    texts_path = f"{OUTPUT_DIR}/texts_for_portraits_{CURRENT_SIZE}.pkl"
 
     # Configuration
     MAX_EVENTS_TO_SHOW = 1000
@@ -693,11 +762,12 @@ def main():
 
         print("✅ Sauvegarde terminée!")
         print(f"Fin: {datetime.now().strftime('%H:%M:%S')}")
+
     # else:
     #     print("\n✅ Aucune correction nécessaire!")
 
     # Charger un client aléatoire
-    texts_path = f"{OUTPUT_DIR}/texts_for_portraits_{TEST_SIZE}.pkl"
+    texts_path = f"{OUTPUT_DIR}/texts_for_portraits_{CURRENT_SIZE}.pkl"
 
     with open(texts_path, 'rb') as f:
         texts = pickle.load(f)
@@ -742,8 +812,9 @@ def main():
 
     from pathlib import Path
     # ====== PARAMÈTRES PAR DÉFAUT ======
-    OUTPUT_DIR       = Path("output_features/gemma1b")
-    TEXTS_FILE       = OUTPUT_DIR / f"texts_for_portraits_{TEST_SIZE}.pkl"
+    OUTPUT_DIR       = Path("output_features/retailrocket_gemma1b")
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    TEXTS_FILE       = OUTPUT_DIR / f"texts_for_portraits_{CURRENT_SIZE}.pkl"
     BATCH_SIZE       = 180          # nb de textes envoyés simultanément au modèle
     CHECKPOINT_EVERY = 100         # batches avant snapshot
     DRY_RUN_SIZE     = 6       # nombre de clients en mode --dry-run
@@ -752,7 +823,7 @@ def main():
     
     def setup_logging(run_id: str) -> None:
         log_dir = OUTPUT_DIR / "logs"
-        log_dir.mkdir(exist_ok=True)
+        log_dir.mkdir(parents=True, exist_ok=True)
         logfile = log_dir / f"main_{run_id}.log"
         logging.basicConfig(
             level=logging.INFO,
@@ -973,7 +1044,7 @@ print(f"[GPU {gpu_id}] FIN — {len(results)} portraits")
         logging.info("GPU %d : %s portraits", a["gpu"], f"{len(res):,}")
 
     # 7) Sauvegarde finale
-    final = OUTPUT_DIR / f"portraits_{len(portraits):,}.pkl.gz"
+    final = OUTPUT_DIR / f"portraits_{CURRENT_SIZE}.pkl.gz"
     with gzip.open(final, "wb") as f:
         pickle.dump(portraits, f, protocol=pickle.HIGHEST_PROTOCOL)
 
@@ -995,16 +1066,16 @@ print(f"[GPU {gpu_id}] FIN — {len(results)} portraits")
 
     from pathlib import Path
 
-    OUTPUT_DIR      = Path("output_features/gemma1b")
-    FEATURES_PKL    = OUTPUT_DIR / f"complete_features_{TEST_SIZE}_clients.pkl" 
-    PORTRAITS_PKL   = OUTPUT_DIR / f"portraits_{TEST_SIZE}.pkl.gz" 
+    OUTPUT_DIR       = Path("output_features/retailrocket_gemma1b")
+    FEATURES_PKL    = OUTPUT_DIR / f"complete_features_{CURRENT_SIZE}_clients.pkl" 
+    PORTRAITS_PKL   = OUTPUT_DIR / f"portraits_{CURRENT_SIZE}.pkl.gz" 
 
     MAX_TOKENS = 2048                 
     USE_AUG2         = False
     DROP_PROB_AUG1   = 0.35
     DROP_PROB_AUG2   = 0.50
     TOKENIZER_NAME   = "google/gemma-3-1b-it"
-    OUT_JSONL_ZST    = OUTPUT_DIR / "complete_dataset_1M.jsonl.zst"
+    OUT_JSONL_ZST = OUTPUT_DIR / f"complete_dataset_{CURRENT_SIZE}.jsonl.zst"
     TOKENIZER_BATCH  = 500
 
     # Vérifier que les fichiers existent
@@ -1109,7 +1180,7 @@ print(f"[GPU {gpu_id}] FIN — {len(results)} portraits")
         print(f"  → Clés: {list(example.keys())}")
         rich_text = example.get("rich_text", "")
         print(f"  → Rich text length: {len(rich_text)} chars")
-        output_file = f"output_features/gemma1b/example_client_{example_cid}.txt"
+        output_file = str(OUTPUT_DIR / f"example_client_{example_cid}.txt")
         with open(output_file, 'w') as f:
             f.write(rich_text)
         if "## PORTRAIT ##" in rich_text:
@@ -1121,154 +1192,15 @@ print(f"[GPU {gpu_id}] FIN — {len(results)} portraits")
     # CELLULE CORRECTIVE : Garantir exactement 1M clients
     # À insérer APRÈS la cellule 3 (fusion) et AVANT la cellule 4 (tokenisation)
     # ============================================
-    print("\n=== CORRECTION POUR 1M CLIENTS ===")
+    print("\n✅ Portrait fusion finished. Skipping old 1M padding block for Retailrocket.")
     print(f"Clients actuels : {len(final_data)}")
-    print(f"Manquants : {1_000_000 - len(final_data)}")
 
-    # 1. Identifier TOUS les client_ids attendus
-    all_client_ids = set(all_results.keys())
-    processed_ids = set(final_data.keys())
-    missing_ids = all_client_ids - processed_ids
-
-    print(f"\nAnalyse des manquants:")
-    print(f"  → IDs dans all_results : {len(all_client_ids)}")
-    print(f"  → IDs traités : {len(processed_ids)}")
-    print(f"  → IDs manquants : {len(missing_ids)}")
-
-    # 2. Analyser pourquoi ils manquent
-    status_counts = {}
-    for cid in list(missing_ids)[:10]:  # Examiner les 10 premiers
-        if cid in all_results:
-            status = all_results[cid].get('status', 'unknown')
-            status_counts[status] = status_counts.get(status, 0) + 1
-
-    print(f"\nStatuts des manquants (échantillon):")
-    for status, count in status_counts.items():
-        print(f"  → {status}: {count}")
-
-    # 3. Créer des entrées fallback pour TOUS les clients manquants
-    print(f"\nCréation de {len(missing_ids)} entrées fallback...")
-
-    for cid in tqdm(missing_ids, desc="Ajout fallback"):
-        # Récupérer ce qu'on peut depuis all_results
-        if cid in all_results:
-            res = all_results[cid]
-
-            # Essayer de récupérer le rich_text même si status != success
-            rich_text = res.get('rich_text', '')
-
-            # Si pas de rich_text, essayer json_str
-            if not rich_text and 'json_str' in res:
-                try:
-                    jd = json.loads(res['json_str'])
-                    rich_text = jd.get('rich_text', '')
-                except:
-                    pass
-
-            # Si toujours rien, créer un texte minimal
-            if not rich_text:
-                rich_text = f"""[PROFILE]
-    ## OVERVIEW ##
-    [CLIENT_{cid}]
-    User Type: inactive
-    Status: {res.get('status', 'unknown')}
-
-    ## CHURN_PROPENSITY ##
-    CHURN_RISK: Unknown
-
-    ## TARGET_WINDOW_14D ##
-    No activity in last 14 days
-
-    ## TEMPORAL ##
-    Inactive: No recorded activity
-
-    ## CUSTOM ##
-    DEFAULT_USER: Fallback profile
-    Generated for completeness
-
-    [END]"""
-        else:
-            # Client complètement absent - créer minimal
-            rich_text = f"""[PROFILE]
-    ## OVERVIEW ##
-    [CLIENT_{cid}]
-    User Type: unknown
-    Status: missing
-
-    ## CUSTOM ##
-    DEFAULT_USER: Missing client
-    Generated for dataset completeness
-
-    [END]"""
-
-        # Ajouter le portrait si disponible
-        if cid in valid_portraits:
-            portrait = valid_portraits[cid].strip()
-            insert = f"\n## PORTRAIT ##\n{portrait}\n"
-            if "[END]" in rich_text:
-                rich_text = rich_text.replace("[END]", insert + "[END]")
-            else:
-                rich_text += insert
-
-        # Créer l'entrée finale
-        final_data[cid] = {
-            "profile": {"client_id": cid, "fallback": True},
-            "rich_text": rich_text
-        }
-
-    # 4. Vérification finale
-    print(f"\n✅ Correction appliquée:")
-    print(f"  → Total clients : {len(final_data)}")
-    print(f"  → Vérification : {'✓ Exactement 1M' if len(final_data) == 1_000_000 else '✗ PAS 1M!'}")
-
-    # 5. S'assurer qu'on a EXACTEMENT 1M
-    if len(final_data) != 1_000_000:
-        print(f"\n⚠️ ATTENTION: {len(final_data)} clients au lieu de 1,000,000!")
-
-        if len(final_data) > 1_000_000:
-            # Trop de clients - en retirer
-            excess = len(final_data) - 1_000_000
-            print(f"Suppression de {excess} clients en excès...")
-            clients_to_remove = list(final_data.keys())[-excess:]
-            for cid in clients_to_remove:
-                del final_data[cid]
-        else:
-            # Pas assez - compléter avec des IDs artificiels
-            shortage = 1_000_000 - len(final_data)
-            print(f"Ajout de {shortage} clients artificiels...")
-            max_id = max(all_client_ids)
-            for i in range(shortage):
-                artificial_id = max_id + i + 1
-                final_data[artificial_id] = {
-                    "profile": {"client_id": artificial_id, "artificial": True},
-                    "rich_text": f"""[PROFILE]
-    ## OVERVIEW ##
-    [CLIENT_{artificial_id}]
-    User Type: artificial
-    Status: padding
-
-    ## CUSTOM ##
-    ARTIFICIAL_USER: Added for 1M requirement
-
-    [END]"""
-                }
-
-    # 6. Vérification FINALE
-    assert len(final_data) == 1_000_000, f"ERREUR: {len(final_data)} clients au lieu de 1,000,000!"
-    print(f"\n✅ SUCCÈS: Exactement {len(final_data):,} clients!")
-
-    # Statistiques
-    fallback_count = sum(1 for d in final_data.values() if d.get('profile', {}).get('fallback', False))
-    artificial_count = sum(1 for d in final_data.values() if d.get('profile', {}).get('artificial', False))
-
-    print(f"\nComposition finale:")
-    print(f"  → Clients originaux : {len(final_data) - fallback_count - artificial_count:,}")
-    print(f"  → Clients fallback : {fallback_count:,}")
-    print(f"  → Clients artificiels : {artificial_count:,}")
-
-    # ============================================
+    print("\n✅ Retailrocket: skipping old 1M padding.")
+    print(f"Final clients for dataset: {len(final_data):,}")
 
     import io
+    # Retailrocket: no artificial 1M padding.
+    # Keep only the actually processed relevant clients.
     def augment_text(text: str, drop_prob: float, seed: int) -> str:
         """Drop aléatoire de lignes non critiques"""
         random.seed(seed)
@@ -1287,7 +1219,7 @@ print(f"[GPU {gpu_id}] FIN — {len(results)} portraits")
 
     print("\n=== SAUVEGARDE DU DATASET FINAL ===")
 
-    output_file = OUTPUT_DIR / "complete_texts_1M.jsonl.zst"
+    output_file = OUTPUT_DIR / f"complete_texts_{CURRENT_SIZE}.jsonl.zst"
     print(f"Destination : {output_file}")
 
     # S'assurer que le dossier de sortie existe
@@ -1380,7 +1312,7 @@ print(f"[GPU {gpu_id}] FIN — {len(results)} portraits")
 
     # ---------- paramètres ----------
     BATCH_TXT  = 4096                       # taille batch texte pour le tokenizer
-    N_WORKERS  = min(os.cpu_count() or 8, 16)  # threads CPU
+    N_WORKERS  = 1  # threads CPU
     MAX_LEN    = MAX_TOKENS
 
     print(f"  → Batch textes      : {BATCH_TXT}")
@@ -1493,7 +1425,7 @@ print(f"[GPU {gpu_id}] FIN — {len(results)} portraits")
     from pathlib import Path
 
     # Vérifier le fichier JSONL.zst correctement
-    OUT_JSONL_ZST = Path(f"{OUTPUT_DIR}/complete_dataset_1M.jsonl.zst")
+    OUT_JSONL_ZST = OUTPUT_DIR / f"complete_dataset_{CURRENT_SIZE}.jsonl.zst"
 
     print("=== VÉRIFICATION DU DATASET ===")
     print(f"Fichier : {OUT_JSONL_ZST}")
@@ -1570,7 +1502,7 @@ print(f"[GPU {gpu_id}] FIN — {len(results)} portraits")
     print(f"\n✅ TOTAL FINAL:")
     print(f"  → Records totaux: {total_records:,}")
     print(f"  → Clients uniques: {len(unique_clients):,}")
-    print(f"  → Vérification: {'✓ OK' if len(unique_clients) == 1_000_000 else '✗ ERREUR'}")
+    print(f"  → Vérification: {'✓ OK' if len(unique_clients) == CURRENT_SIZE else '✗ ERREUR'}")
 
     print("\n✅ Le dataset est prêt pour l'entraînement!")
 
